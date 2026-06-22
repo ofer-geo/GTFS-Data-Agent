@@ -1,4 +1,4 @@
-from config import PROVIDER, GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY
+from config import PROVIDER, GROQ_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
 
 
 def get_client():
@@ -12,5 +12,11 @@ def get_client():
     elif PROVIDER == "anthropic":
         from anthropic import Anthropic
         return Anthropic(api_key=ANTHROPIC_API_KEY)
+    elif PROVIDER == "google":
+        from openai import OpenAI
+        return OpenAI(
+            api_key=GOOGLE_API_KEY,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
     else:
-        raise ValueError(f"Unknown provider: '{PROVIDER}'. Choose groq, openai, or anthropic.")
+        raise ValueError(f"Unknown provider: '{PROVIDER}'. Choose groq, openai, anthropic, or google.")
