@@ -13,12 +13,15 @@ from agent.utils import get_client
 client = get_client()
 
 
-def get_messages(question: str) -> list:
-    """Build the initial message list: system prompt + user question."""
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+def get_messages(history) -> list:
+    """
+    Build the full message list: system prompt + conversation history.
+    history can be a plain string (single question) or a list of
+    {"role": "user"/"assistant", "content": "..."} dicts.
+    """
+    if isinstance(history, str):
+        history = [{"role": "user", "content": history}]
+    return [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
 
 def extract_coords(text: str) -> list:
@@ -52,7 +55,7 @@ def extract_coords(text: str) -> list:
     return out
 
 
-def react_agent(question: str, max_steps: int = 15):
+def react_agent(history, max_steps: int = 15):
     """
     Run the ReAct loop for a given question.
 
@@ -63,7 +66,7 @@ def react_agent(question: str, max_steps: int = 15):
       - coords: list of {lat, lon, label} found so far
       - answer: the final answer string (only when status == "done")
     """
-    messages = get_messages(question)
+    messages = get_messages(history)
     log, coords = [], []
     tool_calls_made = 0
     # Truncate long tool results so we don't overflow the LLM context window
