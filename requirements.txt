@@ -4,3 +4,4 @@ anthropic
 requests
 streamlit
 python-dotenv
+duckdb

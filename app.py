@@ -6,31 +6,47 @@ import json
 # --- Page config ---
 # Must be the first Streamlit call in the file
 st.set_page_config(
-    page_title="Open Bus Agent",
+    page_title="Israel Transit Agent",
     page_icon="🚌",
     layout="wide",
 )
 
+
+# --- Load GTFS data once per session ---
+# @st.cache_resource runs this only on the first load; the DuckDB connection
+# is then reused for every subsequent user interaction.
+@st.cache_resource(show_spinner="Loading GTFS data (first run may take a minute)...")
+def load_gtfs():
+    from agent.gtfs_db import download_and_load
+    from agent import tools
+    conn = download_and_load()
+    tools.set_connection(conn)
+    return conn
+
+
+load_gtfs()
+
+
 # --- Example questions shown in the sidebar ---
 EXAMPLES = [
     "What is the first stop of line 189?",
-    "What is the first stop of line 480?",
-    "How many rides does line 19 have between 07:00 and 08:00 on Jan 1, 2023?",
-    "How many rides does line 18 have on Jan 1, 2023?",
-    "Show the first 5 stops of line 189 on a map",
+    "What is the first stop of line 5 of Dan?",
+    "How many stops does line 480 have?",
+    "Show the stops of line 18 on a map",
+    "What is the last stop of line 19?",
 ]
 
 # --- Things the agent cannot answer ---
 CANNOT = [
-    "Real-time delay — data often unmatched / unreliable",
-    "Passenger counts / occupancy — not in Open Bus",
-    "Long time ranges — exceed the token limit",
+    "Real-time vehicle locations — not in GTFS",
+    "Actual delays — requires live SIRI feed",
+    "Passenger counts / occupancy — not in GTFS",
 ]
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("Open Bus Agent 🚍")
-    st.caption("Ask questions about Israeli public transport using the STRIDE API.")
+    st.header("Israel Transit Agent 🚍")
+    st.caption("Ask questions about Israeli public transport (GTFS schedule data).")
 
     st.markdown("### Example questions")
     # Each button loads its question into the input box
@@ -45,8 +61,8 @@ with st.sidebar:
         st.caption(f"• {item}")
 
 # --- Main area ---
-st.title("Open Bus Agent")
-st.caption("Ask in plain language about stops, ride counts, and bus locations.")
+st.title("Israel Transit Agent")
+st.caption("Ask in plain language about stops, routes, and schedules.")
 
 # The text input — pre-filled if an example button was clicked
 question = st.text_input(

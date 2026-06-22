@@ -67,7 +67,7 @@ def react_agent(question: str, max_steps: int = 15):
     log, coords = [], []
     tool_calls_made = 0
     # Truncate long tool results so we don't overflow the LLM context window
-    MAX_OBS_CHARS = 1200
+    MAX_OBS_CHARS = 3000
 
     for step in range(max_steps):
 
@@ -108,7 +108,7 @@ def react_agent(question: str, max_steps: int = 15):
 
             # Guard: sometimes the model writes a tool call as plain text instead of
             # using the actual function-calling mechanism — catch and correct that
-            if '"name": "query_open_bus_api"' in content or '"type": "function"' in content:
+            if '"type": "function"' in content or ('"name":' in content and '"arguments":' in content):
                 log.append({"type": "retry", "text": "model emitted tool call as text - retrying"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
                 messages.append({"role": "user", "content":
@@ -122,8 +122,8 @@ def react_agent(question: str, max_steps: int = 15):
                 log.append({"type": "retry", "text": "model answered without calling any tool - retrying"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
                 messages.append({"role": "user", "content":
-                    "You have NOT called any tool yet. Use get_open_bus_endpoints or "
-                    "query_open_bus_api now to actually look up the answer."})
+                    "You have NOT called any tool yet. Call run_sql() or get_schema() "
+                    "to look up the answer — do not answer from memory."})
                 continue
 
             # Extract any map coordinates from the final answer
