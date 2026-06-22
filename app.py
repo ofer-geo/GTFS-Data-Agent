@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
-from agent.core import react_agent
+import threading
+import queue
+import time
 import json
 
 st.set_page_config(
@@ -16,9 +18,37 @@ def load_gtfs():
     return download_and_load()
 
 
-# Always wire the cached connection into tools, even after a Streamlit rerun
 from agent import tools as _tools
 _tools.set_connection(load_gtfs())
+
+
+# --- Session state defaults ---
+for key, default in {
+    "chat_history": [],
+    "agent_running": False,
+    "agent_queue": None,
+    "agent_log": [],
+    "agent_coords": [],
+    "agent_answer": None,
+    "stop_event": None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+def _agent_thread(history, result_queue, stop_event):
+    """Run the agent in a background thread, pushing updates into a queue."""
+    from agent.core import react_agent
+    try:
+        for update in react_agent(history, stop_event=stop_event):
+            result_queue.put(update)
+    except Exception as e:
+        result_queue.put({
+            "status": "done", "log": [], "coords": [],
+            "answer": f"Error: {e}",
+        })
+    result_queue.put(None)  # sentinel: agent finished
+
 
 # --- Sidebar ---
 with st.sidebar:
@@ -34,7 +64,7 @@ with st.sidebar:
         "What operators run line 5?",
     ]
     for ex in EXAMPLES:
-        if st.button(ex, use_container_width=True):
+        if st.button(ex, use_container_width=True, disabled=st.session_state.agent_running):
             st.session_state["pending_question"] = ex
 
     st.divider()
@@ -47,13 +77,10 @@ with st.sidebar:
         st.caption(f"• {item}")
 
     st.divider()
-    if st.button("New conversation", use_container_width=True):
+    if st.button("New conversation", use_container_width=True,
+                 disabled=st.session_state.agent_running):
         st.session_state["chat_history"] = []
         st.rerun()
-
-# --- Chat state ---
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
 
 st.title("Israel Transit Agent")
 
@@ -67,66 +94,86 @@ for msg in st.session_state["chat_history"]:
             with st.expander("Map points"):
                 st.dataframe(df, use_container_width=True)
 
-# --- Input: example buttons or typed question ---
-pending = st.session_state.pop("pending_question", None)
-user_input = st.chat_input("Ask about stops, routes, schedules...") or pending
+# ── If agent is running, poll for updates and show a Stop button ──
+if st.session_state.agent_running:
+    q = st.session_state.agent_queue
 
-if user_input:
-    st.session_state["chat_history"].append({"role": "user", "content": user_input})
+    # Drain whatever the background thread has produced so far
+    while True:
+        try:
+            update = q.get_nowait()
+        except queue.Empty:
+            break
 
-    with st.chat_message("user"):
-        st.markdown(user_input)
+        if update is None:  # sentinel: agent finished
+            st.session_state.agent_running = False
 
+            # Store the completed turn in chat history
+            st.session_state["chat_history"].append({
+                "role": "assistant",
+                "content": st.session_state.agent_answer or "",
+                "coords": st.session_state.agent_coords,
+            })
+            st.rerun()
+
+        # Accumulate updates
+        st.session_state.agent_log = update.get("log", st.session_state.agent_log)
+        st.session_state.agent_coords = update.get("coords", st.session_state.agent_coords)
+        if update.get("answer"):
+            st.session_state.agent_answer = update["answer"]
+
+    # Render live progress
     with st.chat_message("assistant"):
-        status_ph = st.empty()
-        log_ph = st.empty()
+        if st.button("⏹ Stop", type="secondary"):
+            st.session_state.stop_event.set()
 
-        final_log, final_coords, final_answer = [], [], ""
+        with st.expander("Agent steps", expanded=True):
+            for i, step in enumerate(st.session_state.agent_log, 1):
+                if step["type"] == "retry":
+                    st.warning(f"{i}. ⟳ {step['text']}")
+                else:
+                    st.markdown(f"**{i}. {step['tool']}**")
+                    st.code(json.dumps(step["args"], ensure_ascii=False), language="json")
+                    st.text(step["observation"])
 
-        # Pass the full conversation history (user + assistant turns only)
+        if st.session_state.agent_answer:
+            st.markdown(st.session_state.agent_answer)
+
+    # Poll again after a short pause
+    time.sleep(0.5)
+    st.rerun()
+
+# ── Input (only shown when agent is idle) ──
+else:
+    pending = st.session_state.pop("pending_question", None)
+    user_input = st.chat_input("Ask about stops, routes, schedules...") or pending
+
+    if user_input:
+        # Show user message
+        st.session_state["chat_history"].append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        # Build full history for the agent (user + assistant turns)
         agent_history = [
             {"role": m["role"], "content": m["content"]}
             for m in st.session_state["chat_history"]
         ]
 
-        for update in react_agent(agent_history):
-            final_log = update.get("log", [])
-            final_coords = update.get("coords", [])
+        # Reset per-run state
+        st.session_state.agent_log = []
+        st.session_state.agent_coords = []
+        st.session_state.agent_answer = None
+        st.session_state.stop_event = threading.Event()
+        st.session_state.agent_queue = queue.Queue()
+        st.session_state.agent_running = True
 
-            if update["status"] == "calling":
-                status_ph.info(f"⚙️ Calling **{update['tool']}**...")
-            elif update["status"] == "step":
-                status_ph.info(f"✅ {len(final_log)} step(s) done, thinking...")
-            elif update["status"] == "retry":
-                status_ph.warning("⟳ Retrying...")
+        # Launch background thread
+        t = threading.Thread(
+            target=_agent_thread,
+            args=(agent_history, st.session_state.agent_queue, st.session_state.stop_event),
+            daemon=True,
+        )
+        t.start()
 
-            with log_ph.container():
-                with st.expander("Agent steps", expanded=False):
-                    for i, step in enumerate(final_log, 1):
-                        if step["type"] == "retry":
-                            st.warning(f"{i}. ⟳ {step['text']}")
-                        else:
-                            st.markdown(f"**{i}. {step['tool']}**")
-                            st.code(
-                                json.dumps(step["args"], ensure_ascii=False),
-                                language="json",
-                            )
-                            st.text(step["observation"])
-
-        status_ph.empty()
-        final_answer = update.get("answer", "")
-
-        st.markdown(final_answer)
-
-        if final_coords:
-            df = pd.DataFrame(final_coords)
-            st.map(df[["lat", "lon"]])
-            with st.expander("Map points"):
-                st.dataframe(df, use_container_width=True)
-
-    # Store the assistant turn (with coords for re-rendering)
-    st.session_state["chat_history"].append({
-        "role": "assistant",
-        "content": final_answer,
-        "coords": final_coords,
-    })
+        st.rerun()

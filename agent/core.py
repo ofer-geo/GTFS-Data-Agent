@@ -122,7 +122,7 @@ def _append_tool_result(messages, tool_call_id, func_name, result, anthropic_raw
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": result})
 
 
-def react_agent(history, max_steps: int = 15):
+def react_agent(history, max_steps: int = 15, stop_event=None):
     """
     ReAct loop. Yields status dicts so app.py can update the UI in real time.
     Accepts either a plain question string or a full conversation history list.
@@ -134,6 +134,11 @@ def react_agent(history, max_steps: int = 15):
     current_response = None  # needed for Anthropic tool result appending
 
     for step in range(max_steps):
+
+        # --- Check stop request ---
+        if stop_event and stop_event.is_set():
+            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": "Stopped by user."}
+            return
 
         # --- Call the LLM ---
         try:
@@ -153,7 +158,10 @@ def react_agent(history, max_steps: int = 15):
             if status in (413, 429) or "rate_limit" in es or "too large" in es.lower() or "overloaded" in es.lower():
                 log.append({"type": "retry", "text": "rate limit - waiting 20s"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
-                time.sleep(20)
+                for _ in range(40):  # 40 × 0.5s = 20s, interruptible
+                    if stop_event and stop_event.is_set():
+                        break
+                    time.sleep(0.5)
                 continue
 
             raise
