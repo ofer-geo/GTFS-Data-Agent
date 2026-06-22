@@ -110,68 +110,87 @@ def _disambiguate(routes, line_number: str):
 
 # --- Tool functions ---
 
-def get_line_stops(line_number: str, date: str = "2024-01-01",
-                   operator: str = "", cluster: str = "") -> str:
-    """Get all stops for one trip of a bus line on a given date, ordered by stop sequence."""
+def get_line_stops(line_number: str, operator: str = "", cluster: str = "") -> str:
+    """
+    Get stops for both directions of a bus line from GTFS data (no date needed).
+    For each direction (0 and 1), fetches one representative ride then retrieves
+    its complete stop list in sequence order.
+    Use gtfs_route__agency_name for operator and gtfs_route__route_direction for direction.
+    """
     try:
-        # Step 1: resolve routes and check for operator/cluster ambiguity
-        routes, err = _get_routes_for_line(line_number, operator, cluster)
-        if err:
-            return err
-        if not routes:
-            suffix = f" (operator={operator!r}, cluster={cluster!r})" if (operator or cluster) else ""
-            return f"No routes found for line {line_number}{suffix}."
-
-        msg = _disambiguate(routes, line_number)
-        if msg:
-            return msg
-
-        # Step 2: get one ride for the first route on this date
-        # (all remaining routes share the same operator+cluster, so any route_id is fine)
-        route_id = routes[0]["id"]
-        operator_name = routes[0].get("agency__name", "")
-        cluster_name  = routes[0].get("cluster__name", "")
-
-        r1 = requests.get(
-            OPEN_BUS_BASE_URL + "/gtfs_rides/list",
-            params={
-                "gtfs_route_id": route_id,
-                "start_time_from": f"{date}T00:00:00Z",
-                "start_time_to":   f"{date}T23:59:59Z",
-                "limit": 1,
-            },
-            headers=HEADERS,
-            timeout=60,
-        )
-        r1.raise_for_status()
-        rides = r1.json()
-        if not rides:
-            return f"No rides found for line {line_number} on {date}. Try a different date."
-        ride_id = rides[0]["id"]
-
-        # Step 3: get all stops for that single ride (one direction, no mixing)
-        r2 = requests.get(
-            OPEN_BUS_BASE_URL + "/gtfs_ride_stops/list",
-            params={"gtfs_ride_id": ride_id, "order_by": "stop_sequence asc", "limit": 200},
-            headers=HEADERS,
-            timeout=60,
-        )
-        r2.raise_for_status()
-        rows = r2.json()
-        stops = [
-            {
-                "stop_sequence": row.get("stop_sequence"),
-                "name": row.get("gtfs_stop__name", ""),
-                "lat": row.get("gtfs_stop__lat"),
-                "lon": row.get("gtfs_stop__lon"),
+        directions = []
+        for direction in [0, 1]:
+            # Phase 1: get one ride_id for this direction
+            params = {
+                "gtfs_route__route_short_name": line_number,
+                "gtfs_route__route_direction":  direction,
+                "limit": 5,
             }
-            for row in rows
-        ]
-        return (
-            f"Line {line_number} | operator: {operator_name} | cluster: {cluster_name} | "
-            f"{date}: {len(stops)} stop(s).\n"
-            + json.dumps(stops, ensure_ascii=False)
-        )
+            if operator:
+                params["gtfs_route__agency_name"] = operator
+
+            r1 = requests.get(
+                OPEN_BUS_BASE_URL + "/gtfs_ride_stops/list",
+                params=params,
+                headers=HEADERS,
+                timeout=60,
+            )
+            r1.raise_for_status()
+            sample = r1.json()
+
+            if not sample:
+                continue  # this direction doesn't exist for the line
+
+            ride_id = sample[0].get("gtfs_ride_id")
+            if not ride_id:
+                continue
+
+            # Phase 2: fetch the complete ordered stop list for this ride
+            r2 = requests.get(
+                OPEN_BUS_BASE_URL + "/gtfs_ride_stops/list",
+                params={
+                    "gtfs_ride_ids": ride_id,
+                    "order_by": "stop_sequence asc",
+                    "limit": 200,
+                },
+                headers=HEADERS,
+                timeout=60,
+            )
+            r2.raise_for_status()
+            stops = [
+                {
+                    "stop_sequence": row.get("stop_sequence"),
+                    "name": row.get("gtfs_stop__name", ""),
+                    "lat": row.get("gtfs_stop__lat"),
+                    "lon": row.get("gtfs_stop__lon"),
+                }
+                for row in r2.json()
+            ]
+
+            if not stops:
+                continue
+
+            directions.append({
+                "direction": direction,
+                "ride_id": ride_id,
+                "stop_count": len(stops),
+                "first_stop": stops[0]["name"],
+                "last_stop":  stops[-1]["name"],
+                "stops": stops,
+            })
+
+        if not directions:
+            return f"No stops found for line {line_number}."
+
+        output = f"Line {line_number}: {len(directions)} direction(s).\n"
+        for d in directions:
+            output += (
+                f"\nDirection {d['direction']}: {d['stop_count']} stops | "
+                f"{d['first_stop']} → {d['last_stop']}\n"
+            )
+            output += json.dumps(d["stops"], ensure_ascii=False) + "\n"
+        return output
+
     except requests.exceptions.HTTPError as e:
         return f"HTTP error: {e}"
     except Exception as e:
@@ -320,38 +339,31 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "get_line_stops",
             "description": (
-                "Get all stops for a bus line on a given date, ordered by stop sequence. "
-                "Returns stop name, coordinates (lat/lon), and sequence number for one trip. "
-                "Prefer this over query_open_bus_api for any question about stops of a line. "
-                "If the tool returns an ambiguity message, ask the user to choose operator and cluster, "
-                "then call again with those values filled in."
+                "Get the stops for both directions of a bus line from GTFS data. "
+                "No date required — queries the planned route structure directly. "
+                "Returns up to 2 directions, each with the full ordered stop list "
+                "(name, lat, lon, sequence) and a first→last stop summary. "
+                "Prefer this over query_open_bus_api for any stop-related question."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "line_number": {
                         "type": "string",
-                        "description": "The bus line number, e.g. '189', '480', '19'.",
-                    },
-                    "date": {
-                        "type": "string",
-                        "description": (
-                            "Date in YYYY-MM-DD format, e.g. '2024-01-01'. "
-                            "Defaults to 2024-01-01 if not specified."
-                        ),
+                        "description": "The bus line number, e.g. '189', '480', '5'.",
                     },
                     "operator": {
                         "type": "string",
                         "description": (
                             "Optional. Operator (agency) name to filter by, e.g. 'דן', 'אגד'. "
-                            "Use when the tool returns an ambiguity message listing multiple operators."
+                            "Use the Hebrew name as it appears in the data."
                         ),
                     },
                     "cluster": {
                         "type": "string",
                         "description": (
-                            "Optional. Cluster (city/area) name to filter by, e.g. 'תל אביב', 'בני ברק'. "
-                            "Use when the tool returns an ambiguity message listing multiple clusters."
+                            "Optional. City/area cluster to filter by, e.g. 'תל אביב'. "
+                            "Use when the same line number exists in multiple cities."
                         ),
                     },
                 },

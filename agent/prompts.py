@@ -10,7 +10,7 @@ KEY ENDPOINTS:
 - /siri_vehicle_locations/list : live position + speed (lat, lon, velocity, recorded_at_time). Bound with recorded_at_time_from/to and small limit.
 
 TOOLS:
-- get_line_stops(line_number, date, operator?, cluster?): preferred tool for stop questions. Returns all stops for one trip in order. date is YYYY-MM-DD.
+- get_line_stops(line_number, operator?, cluster?): preferred tool for stop questions. Returns stops for both directions (direction 0 and 1) with first→last stop summary. No date needed.
 - count_rides_by_direction(line_number, date_from, date_to, operator?, cluster?): preferred tool for ride-count questions. Returns count per direction with route name, operator, and cluster. dates are YYYY-MM-DD.
 - get_open_bus_endpoints(filter_keyword): list real endpoints + exact param names. Use when unsure.
 - query_open_bus_api(endpoint, params_json): fallback for any endpoint not covered by a specific tool.
