@@ -2,7 +2,7 @@ import json
 import time
 import re
 
-from groq import BadRequestError, APIStatusError
+from openai import BadRequestError, APIStatusError
 
 from config import MODEL
 from agent.tools import tools_map, TOOLS_SCHEMA
