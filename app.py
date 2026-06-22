@@ -13,13 +13,12 @@ st.set_page_config(
 @st.cache_resource(show_spinner="Loading GTFS data (first run may take a minute)...")
 def load_gtfs():
     from agent.gtfs_db import download_and_load
-    from agent import tools
-    conn = download_and_load()
-    tools.set_connection(conn)
-    return conn
+    return download_and_load()
 
 
-load_gtfs()
+# Always wire the cached connection into tools, even after a Streamlit rerun
+from agent import tools as _tools
+_tools.set_connection(load_gtfs())
 
 # --- Sidebar ---
 with st.sidebar:
