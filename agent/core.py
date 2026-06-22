@@ -2,7 +2,13 @@ import json
 import time
 import re
 
-from openai import BadRequestError, APIStatusError
+from config import PROVIDER
+if PROVIDER == "groq":
+    from groq import BadRequestError, APIStatusError
+elif PROVIDER == "anthropic":
+    from anthropic import BadRequestError, APIStatusError
+else:
+    from openai import BadRequestError, APIStatusError
 
 from config import MODEL
 from agent.tools import tools_map, TOOLS_SCHEMA
