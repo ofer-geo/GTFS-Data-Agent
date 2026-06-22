@@ -139,7 +139,7 @@ def react_agent(history, max_steps: int = 15):
 
         for tool_call in msg.tool_calls:
             func_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
+            args = json.loads(tool_call.function.arguments) or {}
 
             # Let app.py show "calling tool X..." in the UI
             yield {"status": "calling", "tool": func_name, "args": args,
