@@ -13,6 +13,8 @@ def get_client():
         from anthropic import Anthropic
         return Anthropic(api_key=ANTHROPIC_API_KEY)
     elif PROVIDER == "google":
+        if not GOOGLE_API_KEY:
+            raise ValueError("GOOGLE_API_KEY is missing. Add it to your .env file.")
         from openai import OpenAI
         return OpenAI(
             api_key=GOOGLE_API_KEY,
