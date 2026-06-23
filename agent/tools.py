@@ -28,6 +28,30 @@ def get_schema() -> str:
         return f"Error: {e}"
 
 
+def get_line_variants(line_number: str) -> str:
+    """
+    Return all route variants for a given line number (route_short_name),
+    including operator (agency_name) and route area (route_long_name).
+    Always call this first for any question about a specific line.
+    """
+    if _conn is None:
+        return "Error: GTFS database not loaded yet."
+    try:
+        rows = _conn.execute("""
+            SELECT DISTINCT r.route_id, a.agency_name, r.route_long_name
+            FROM routes r
+            JOIN agency a ON r.agency_id = a.agency_id
+            WHERE r.route_short_name = ?
+            ORDER BY a.agency_name, r.route_long_name
+        """, [str(line_number)]).fetchall()
+        if not rows:
+            return f"No routes found for line number '{line_number}'."
+        records = [{"route_id": r[0], "agency_name": r[1], "route_long_name": r[2]} for r in rows]
+        return json.dumps(records, ensure_ascii=False)
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def run_sql(query: str) -> str:
     """
     Execute a SQL SELECT query against the GTFS database and return results as JSON.
@@ -53,6 +77,7 @@ def run_sql(query: str) -> str:
 # ---- Tools map ----
 tools_map = {
     "get_schema": get_schema,
+    "get_line_variants": get_line_variants,
     "run_sql": run_sql,
 }
 
@@ -70,6 +95,27 @@ TOOLS_SCHEMA = [
                 "type": "object",
                 "properties": {},
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_line_variants",
+            "description": (
+                "ALWAYS call this first for any question about a specific line number. "
+                "Returns all route variants for that line: operator (agency_name) and route area (route_long_name). "
+                "If multiple variants exist, present them as a numbered list and ask the user to choose before proceeding."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "line_number": {
+                        "type": "string",
+                        "description": "The line number to look up, e.g. '5' or '480'.",
+                    }
+                },
+                "required": ["line_number"],
             },
         },
     },
