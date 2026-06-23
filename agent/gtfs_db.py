@@ -14,10 +14,12 @@ TABLES = [
     "stop_times",
     "calendar",
     "calendar_dates",
-    "shapes",
-    "translations",
-    "fare_rules",
 ]
+
+# Excluded to fit Streamlit Cloud memory limits (~1GB RAM):
+# "shapes"       — 7M rows, only needed for route geometry on map
+# "translations" — 101K rows, English name translations
+# "fare_rules"   — 962K rows, fare data
 
 
 def download_and_load(gtfs_dir: str = None) -> duckdb.DuckDBPyConnection:
