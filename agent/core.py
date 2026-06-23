@@ -8,6 +8,7 @@ from agent.prompts import SYSTEM_PROMPT
 from agent.utils import get_client
 
 client = get_client()
+print(f"[Agent] Provider: {PROVIDER!r}  Model: {MODEL!r}")
 
 # Convert OpenAI-style tools schema to Anthropic format
 ANTHROPIC_TOOLS = [
@@ -127,6 +128,7 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
     ReAct loop. Yields status dicts so app.py can update the UI in real time.
     Accepts either a plain question string or a full conversation history list.
     """
+    print(f"[Agent] New query → provider={PROVIDER!r} model={MODEL!r}")
     messages = get_messages(history)
     log, coords = [], []
     tool_calls_made = 0
@@ -146,6 +148,7 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
         except Exception as e:
             es = str(e)
             status = getattr(e, "status_code", None)
+            print(f"[Agent] LLM error — type={type(e).__name__!r} status={status!r} msg={es[:300]!r}")
 
             if "tool_use_failed" in es or (status == 400 and "tool" in es.lower()):
                 log.append({"type": "retry", "text": "tool_use_failed - retrying"})
