@@ -211,12 +211,13 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
             messages.append(current_response.choices[0].message)
 
         stop_after_tool = False
+        can_proceed = False
+        last_parsed = {}
 
         for tool_call in tool_calls:
             func_name = tool_call.function.name
             args = json.loads(tool_call.function.arguments) or {}
 
-            # Strip unexpected args that confuse some tools
             if func_name == "get_line_variants":
                 args = {k: v for k, v in args.items() if k in {"line_number", "agency_name"}}
 
@@ -229,11 +230,12 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
                 result = tools_map[func_name](**args)
                 tool_calls_made += 1
 
-            # If the tool needs user clarification, stop here after feeding the result
             try:
-                parsed = json.loads(result)
-                if parsed.get("clarification_needed"):
+                last_parsed = json.loads(result)
+                if last_parsed.get("clarification_needed"):
                     stop_after_tool = True
+                elif last_parsed.get("can_proceed"):
+                    can_proceed = True
             except (json.JSONDecodeError, AttributeError):
                 pass
 
@@ -244,17 +246,37 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
             trimmed = result if len(result) <= MAX_OBS_CHARS else result[:MAX_OBS_CHARS] + "\n...[truncated]"
             _append_tool_result(messages, tool_call.id, func_name, trimmed, current_response)
 
-            if stop_after_tool:
-                break  # don't process more tool calls
+            if stop_after_tool or can_proceed:
+                break
 
+        # --- Line identified: say what was found and what can't be answered yet ---
+        if can_proceed:
+            selected = last_parsed.get("selected_line", {})
+            agency = last_parsed.get("agency_name") or selected.get("agency_name", "")
+            line_num = last_parsed.get("line_number", "")
+            route_names = selected.get("route_long_names", [])
+            route_desc = route_names[0] if route_names else selected.get("route_long_name", "")
+
+            original_q = next(
+                (m["content"] for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                ""
+            )
+
+            answer = f"זיהיתי: קו {line_num} של {agency}"
+            if route_desc:
+                answer += f" — {route_desc}"
+            answer += f".\n\nאין לי עדיין כלי לענות על: \"{original_q}\"."
+
+            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": answer}
+            return
+
+        # --- Clarification needed: format numbered list directly in Python ---
         if stop_after_tool:
-            # Format the clarification list directly in Python — never trust LLM formatting
             try:
-                parsed_result = json.loads(result)
-                options = parsed_result.get("options", [])
-                ctype = parsed_result.get("clarification_needed", "")
-                line_num = parsed_result.get("line_number", "")
-                agency = parsed_result.get("agency_name", "")
+                options = last_parsed.get("options", [])
+                ctype = last_parsed.get("clarification_needed", "")
+                line_num = last_parsed.get("line_number", "")
+                agency = last_parsed.get("agency_name", "")
 
                 if ctype == "agency":
                     intro = f"קו {line_num} קיים אצל מספר מפעילים. בחר מפעיל:"
