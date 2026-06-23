@@ -24,10 +24,23 @@ ANTHROPIC_TOOLS = [
 def get_messages(history) -> list:
     if isinstance(history, str):
         history = [{"role": "user", "content": history}]
-    # Anthropic takes system as a separate param; OpenAI/Groq as first message
+
+    from agent.tools import selection_state
+    pending = selection_state.get("pending_type")
+
+    system = SYSTEM_PROMPT
+    if pending:
+        system += (
+            f"\n\n⚠️ CURRENT STATE: You presented a numbered list and are waiting for the user "
+            f"to choose (pending_type='{pending}'). "
+            f"The user's latest message is their selection number. "
+            f"You MUST call select_option(option_number) with that number. "
+            f"Do NOT call get_line_variants again."
+        )
+
     if PROVIDER == "anthropic":
         return [m for m in history if m["role"] != "system"]
-    return [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    return [{"role": "system", "content": system}] + list(history)
 
 
 def extract_coords(text: str) -> list:
