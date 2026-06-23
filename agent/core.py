@@ -53,7 +53,7 @@ def extract_coords(text: str) -> list:
     return out
 
 
-def _call_llm(messages):
+def _call_llm(messages, tool_choice="auto"):
     """Call the LLM using the correct SDK for the active provider."""
     if PROVIDER == "anthropic":
         return client.messages.create(
@@ -68,7 +68,7 @@ def _call_llm(messages):
             model=MODEL,
             messages=messages,
             tools=TOOLS_SCHEMA,
-            tool_choice="auto",
+            tool_choice=tool_choice,
             parallel_tool_calls=False,
         )
 
@@ -133,7 +133,8 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
     log, coords = [], []
     tool_calls_made = 0
     MAX_OBS_CHARS = 3000
-    current_response = None  # needed for Anthropic tool result appending
+    current_response = None
+    force_text = False  # set True after clarification_needed to force text-only response
 
     for step in range(max_steps):
 
@@ -144,7 +145,8 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
 
         # --- Call the LLM ---
         try:
-            current_response = _call_llm(messages)
+            current_response = _call_llm(messages, tool_choice="none" if force_text else "auto")
+            force_text = False
         except Exception as e:
             es = str(e)
             status = getattr(e, "status_code", None)
@@ -233,9 +235,10 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
             _append_tool_result(messages, tool_call.id, func_name, trimmed, current_response)
 
             if stop_after_tool:
-                break  # don't process more tool calls; let LLM generate clarification
+                break  # don't process more tool calls
 
         if stop_after_tool:
-            continue  # go back to LLM so it produces the clarification question
+            force_text = True  # next LLM call must produce text, not a tool call
+            continue
 
     yield {"status": "done", "log": list(log), "coords": list(coords), "answer": "Max steps reached"}
