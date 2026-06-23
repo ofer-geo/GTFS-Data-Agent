@@ -198,9 +198,15 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
         if PROVIDER != "anthropic":
             messages.append(current_response.choices[0].message)
 
+        stop_after_tool = False
+
         for tool_call in tool_calls:
             func_name = tool_call.function.name
             args = json.loads(tool_call.function.arguments) or {}
+
+            # Strip unexpected args that confuse some tools
+            if func_name == "get_line_variants":
+                args = {k: v for k, v in args.items() if k in {"line_number", "agency_name"}}
 
             yield {"status": "calling", "tool": func_name, "args": args,
                    "log": list(log), "coords": list(coords), "answer": None}
@@ -211,11 +217,25 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
                 result = tools_map[func_name](**args)
                 tool_calls_made += 1
 
+            # If the tool needs user clarification, stop here after feeding the result
+            try:
+                parsed = json.loads(result)
+                if parsed.get("clarification_needed"):
+                    stop_after_tool = True
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
             log.append({"type": "action", "tool": func_name, "args": args, "observation": result[:500]})
             coords += extract_coords(result)
             yield {"status": "step", "log": list(log), "coords": list(coords), "answer": None}
 
             trimmed = result if len(result) <= MAX_OBS_CHARS else result[:MAX_OBS_CHARS] + "\n...[truncated]"
             _append_tool_result(messages, tool_call.id, func_name, trimmed, current_response)
+
+            if stop_after_tool:
+                break  # don't process more tool calls; let LLM generate clarification
+
+        if stop_after_tool:
+            continue  # go back to LLM so it produces the clarification question
 
     yield {"status": "done", "log": list(log), "coords": list(coords), "answer": "Max steps reached"}

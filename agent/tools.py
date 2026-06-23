@@ -1,10 +1,19 @@
 import json
+import re
 import duckdb
+from collections import defaultdict
 
-# Set by app.py via set_connection() after GTFS is loaded
 _conn: duckdb.DuckDBPyConnection = None
+MAX_ROWS = 100
 
-MAX_ROWS = 100  # cap rows returned to LLM to avoid context overflow
+# Persists across turns so select_option can map numbers to Hebrew values
+selection_state = {
+    "pending_type": None,
+    "line_number": None,
+    "agencies": [],
+    "grouped_lines": [],
+    "options": [],
+}
 
 
 def set_connection(conn: duckdb.DuckDBPyConnection):
@@ -13,7 +22,6 @@ def set_connection(conn: duckdb.DuckDBPyConnection):
 
 
 def get_schema() -> str:
-    """Return the column names and types for every GTFS table in the database."""
     if _conn is None:
         return "Error: GTFS database not loaded yet."
     try:
@@ -28,47 +36,188 @@ def get_schema() -> str:
         return f"Error: {e}"
 
 
-def get_line_variants(line_number: str) -> str:
+def get_line_variants(line_number: str, agency_name: str = None) -> str:
     """
-    Return all route variants for a given line number (route_short_name),
-    including operator (agency_name) and route area (route_long_name).
-    Always call this first for any question about a specific line.
+    Return route variants for a given line number.
+    Stage 1 (no agency_name): if multiple agencies exist, ask for agency.
+    Stage 2 (agency_name given): if multiple real lines in that agency, ask for route.
+    Stage 3: uniquely identified — can_proceed = true.
     """
     if _conn is None:
         return "Error: GTFS database not loaded yet."
     try:
-        rows = _conn.execute("""
-            SELECT DISTINCT r.route_id, a.agency_name, r.route_long_name
+        params = [str(line_number)]
+        where_clause = "WHERE r.route_short_name = ?"
+        if agency_name:
+            where_clause += " AND a.agency_name = ?"
+            params.append(agency_name)
+
+        rows = _conn.execute(f"""
+            SELECT DISTINCT
+                r.route_id, a.agency_name, r.route_long_name, r.route_desc
             FROM routes r
             JOIN agency a ON r.agency_id = a.agency_id
-            WHERE r.route_short_name = ?
-            ORDER BY a.agency_name, r.route_long_name
-        """, [str(line_number)]).fetchall()
+            {where_clause}
+            ORDER BY a.agency_name, r.route_long_name, r.route_id
+        """, params).fetchall()
+
         if not rows:
-            return f"No routes found for line number '{line_number}'."
-        records = [{"route_id": r[0], "agency_name": r[1], "route_long_name": r[2]} for r in rows]
-        return json.dumps(records, ensure_ascii=False)
+            msg = f"No routes found for line number '{line_number}'"
+            if agency_name:
+                msg += f" and agency '{agency_name}'"
+            return json.dumps({
+                "line_number": line_number,
+                "agency_name": agency_name,
+                "can_proceed": False,
+                "clarification_needed": None,
+                "reason": msg + ".",
+                "routes": [],
+            }, ensure_ascii=False, indent=2)
+
+        routes = []
+        for route_id, row_agency, route_long_name, route_desc in rows:
+            match = re.search(r"\b\d{5}\b", route_desc or "")
+            routes.append({
+                "route_id": route_id,
+                "agency_name": row_agency,
+                "route_long_name": route_long_name,
+                "route_desc": route_desc,
+                "route_code_5_digits": match.group(0) if match else None,
+            })
+
+        agencies = sorted(set(r["agency_name"] for r in routes))
+
+        # Stage 1: multiple agencies → ask which one
+        if agency_name is None and len(agencies) > 1:
+            selection_state.update({
+                "pending_type": "agency",
+                "line_number": line_number,
+                "agencies": agencies,
+                "grouped_lines": [],
+                "options": [],
+            })
+            return json.dumps({
+                "line_number": line_number,
+                "can_proceed": False,
+                "clarification_needed": "agency",
+                "reason": f"Line '{line_number}' exists in more than one agency.",
+                "agencies_count": len(agencies),
+                "agencies": agencies,
+            }, ensure_ascii=False, indent=2)
+
+        # Stage 2: group real lines within this agency by 5-digit route code
+        line_groups = defaultdict(list)
+        for r in routes:
+            key = r["route_code_5_digits"] or f"route_id:{r['route_id']}"
+            line_groups[key].append(r)
+
+        grouped_lines = []
+        for route_code, group_routes in line_groups.items():
+            grouped_lines.append({
+                "agency_name": group_routes[0]["agency_name"],
+                "route_code_5_digits": None if route_code.startswith("route_id:") else route_code,
+                "variants_count": len(group_routes),
+                "route_ids": [r["route_id"] for r in group_routes],
+                "route_long_names": sorted(set(r["route_long_name"] for r in group_routes)),
+                "route_descriptions": [r["route_desc"] for r in group_routes],
+                "routes": group_routes,
+            })
+
+        if len(grouped_lines) > 1:
+            options = [
+                {
+                    "option_number": i,
+                    "label": " / ".join(g["route_long_names"]),
+                    "route_code_5_digits": g["route_code_5_digits"],
+                    "route_ids": g["route_ids"],
+                }
+                for i, g in enumerate(grouped_lines, 1)
+            ]
+            selection_state.update({
+                "pending_type": "route",
+                "line_number": line_number,
+                "agencies": [],
+                "grouped_lines": grouped_lines,
+                "options": options,
+            })
+            return json.dumps({
+                "line_number": line_number,
+                "agency_name": agencies[0] if len(agencies) == 1 else agency_name,
+                "can_proceed": False,
+                "clarification_needed": "route",
+                "reason": f"Line '{line_number}' has more than one route/area for this agency.",
+                "line_groups_count": len(grouped_lines),
+                "options": options,
+                "grouped_lines": grouped_lines,
+            }, ensure_ascii=False, indent=2)
+
+        # Stage 3: uniquely identified
+        selection_state.update({
+            "pending_type": None,
+            "agencies": [],
+            "grouped_lines": [],
+            "options": [],
+        })
+        selected_group = grouped_lines[0]
+        return json.dumps({
+            "line_number": line_number,
+            "agency_name": selected_group["agency_name"],
+            "can_proceed": True,
+            "clarification_needed": None,
+            "reason": f"Line '{line_number}' is uniquely identified.",
+            "routes_count": len(routes),
+            "selected_line": selected_group,
+            "routes": routes,
+        }, ensure_ascii=False, indent=2)
+
     except Exception as e:
         return f"Error: {e}"
 
 
+def select_option(option_number: int) -> str:
+    """
+    Map the user's numbered choice to the stored Hebrew agency/route value.
+    Call this whenever the user replies with a number after a numbered list.
+    """
+    option_number = int(option_number)
+    idx = option_number - 1
+    pending_type = selection_state.get("pending_type")
+
+    if pending_type == "agency":
+        agencies = selection_state.get("agencies", [])
+        if idx < 0 or idx >= len(agencies):
+            return json.dumps({"error": f"Invalid option {option_number}. Valid range: 1–{len(agencies)}"})
+        agency_name = agencies[idx]
+        line_number = selection_state["line_number"]
+        return get_line_variants(line_number=line_number, agency_name=agency_name)
+
+    if pending_type == "route":
+        grouped_lines = selection_state.get("grouped_lines", [])
+        if idx < 0 or idx >= len(grouped_lines):
+            return json.dumps({"error": f"Invalid option {option_number}. Valid range: 1–{len(grouped_lines)}"})
+        selected_line = grouped_lines[idx]
+        selection_state.update({"pending_type": None, "grouped_lines": [], "options": []})
+        return json.dumps({
+            "can_proceed": True,
+            "clarification_needed": None,
+            "selected_line": selected_line,
+            "reason": "Route option selected. The agent can proceed.",
+        }, ensure_ascii=False, indent=2)
+
+    return json.dumps({"error": "No pending selection. Ask the user a question first."})
+
+
 def run_sql(query: str) -> str:
-    """
-    Execute a SQL SELECT query against the GTFS database and return results as JSON.
-    Always use LIMIT in your queries. Maximum rows returned: 100.
-    """
     if _conn is None:
         return "Error: GTFS database not loaded yet."
     try:
         rel = _conn.execute(query)
         cols = [desc[0] for desc in rel.description]
         rows = rel.fetchmany(MAX_ROWS)
-        extra = ""
-        if len(rows) == MAX_ROWS:
-            extra = f"\n[results capped at {MAX_ROWS} rows]"
         records = [dict(zip(cols, row)) for row in rows]
         if not records:
             return "Query returned no results."
+        extra = f"\n[capped at {MAX_ROWS} rows]" if len(rows) == MAX_ROWS else ""
         return json.dumps(records, ensure_ascii=False, default=str) + extra
     except Exception as e:
         return f"SQL Error: {e}"
@@ -78,24 +227,17 @@ def run_sql(query: str) -> str:
 tools_map = {
     "get_schema": get_schema,
     "get_line_variants": get_line_variants,
-    "run_sql": run_sql,
+    "select_option": select_option,
 }
 
-# ---- Tools schema (sent to LLM on every request) ----
+# ---- Tools schema ----
 TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
             "name": "get_schema",
-            "description": (
-                "Return the column names and data types for every table in the GTFS database. "
-                "Call this first if you are unsure which columns or tables to use."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
+            "description": "Return column names and types for every GTFS table. Use only for technical/database questions.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
     {
@@ -103,17 +245,23 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "get_line_variants",
             "description": (
-                "ALWAYS call this first for any question about a specific line number. "
-                "Returns all route variants for that line: operator (agency_name) and route area (route_long_name). "
-                "If multiple variants exist, present them as a numbered list and ask the user to choose before proceeding."
+                "Call this whenever the user asks about a specific line number. "
+                "First call with only line_number. "
+                "If clarification_needed='agency', ask the user to pick an agency, then call again with agency_name. "
+                "If clarification_needed='route', ask the user to pick a route. "
+                "If can_proceed=true, the line is uniquely identified."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "line_number": {
                         "type": "string",
-                        "description": "The line number to look up, e.g. '5' or '480'.",
-                    }
+                        "description": "The line number, e.g. '5' or '480'. Pass only the number.",
+                    },
+                    "agency_name": {
+                        "type": "string",
+                        "description": "Optional agency name chosen by the user, e.g. 'דן', 'אגד'.",
+                    },
                 },
                 "required": ["line_number"],
             },
@@ -122,24 +270,20 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "run_sql",
+            "name": "select_option",
             "description": (
-                "Execute a SQL SELECT query against the local GTFS database and return results as JSON. "
-                "Tables: agency, stops, routes, trips, stop_times, calendar, calendar_dates. "
-                "Always include a LIMIT clause. Max rows returned is 100."
+                "Call this when the user replies with a number after a numbered list of agencies or routes. "
+                "Do not interpret the number yourself — this tool maps it to the correct stored value."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "A valid SQL SELECT statement. Example: "
-                            "\"SELECT stop_name, stop_lat, stop_lon FROM stops LIMIT 5\""
-                        ),
+                    "option_number": {
+                        "type": "integer",
+                        "description": "The number the user selected from the list.",
                     }
                 },
-                "required": ["query"],
+                "required": ["option_number"],
             },
         },
     },
