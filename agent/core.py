@@ -239,6 +239,10 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
 
         if stop_after_tool:
             force_text = True  # next LLM call must produce text, not a tool call
+            messages.append({
+                "role": "user",
+                "content": "Present ALL the options from the tool result as a numbered list. Include every item. Do not summarize or skip any.",
+            })
             continue
 
     yield {"status": "done", "log": list(log), "coords": list(coords), "answer": "Max steps reached"}
