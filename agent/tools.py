@@ -96,13 +96,14 @@ def get_line_variants(line_number: str, agency_name: str = None) -> str:
                 "grouped_lines": [],
                 "options": [],
             })
+            options = [{"option_number": i, "label": a} for i, a in enumerate(agencies, 1)]
             return json.dumps({
                 "line_number": line_number,
                 "can_proceed": False,
                 "clarification_needed": "agency",
-                "reason": f"Line '{line_number}' exists in more than one agency.",
-                "agencies_count": len(agencies),
-                "agencies": agencies,
+                "options_count": len(options),
+                "options": options,
+                "instruction": f"Show ONLY the options list above as a numbered list. Valid choices: 1 to {len(options)}. Ask the user to enter a number.",
             }, ensure_ascii=False, indent=2)
 
         # Stage 2: group real lines within this agency by 5-digit route code
@@ -146,9 +147,9 @@ def get_line_variants(line_number: str, agency_name: str = None) -> str:
                 "can_proceed": False,
                 "clarification_needed": "route",
                 "reason": f"Line '{line_number}' has more than one route/area for this agency.",
-                "line_groups_count": len(grouped_lines),
+                "options_count": len(options),
                 "options": options,
-                "grouped_lines": grouped_lines,
+                "instruction": f"Show ONLY the options list above as a numbered list. Valid choices: 1 to {len(options)}. Ask the user to enter a number.",
             }, ensure_ascii=False, indent=2)
 
         # Stage 3: uniquely identified
