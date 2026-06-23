@@ -147,8 +147,6 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
     tool_calls_made = 0
     MAX_OBS_CHARS = 3000
     current_response = None
-    force_text = False  # set True after clarification_needed to force text-only response
-
     for step in range(max_steps):
 
         # --- Check stop request ---
@@ -158,8 +156,7 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
 
         # --- Call the LLM ---
         try:
-            current_response = _call_llm(messages, tool_choice="none" if force_text else "auto")
-            force_text = False
+            current_response = _call_llm(messages)
         except Exception as e:
             es = str(e)
             status = getattr(e, "status_code", None)
@@ -251,11 +248,28 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
                 break  # don't process more tool calls
 
         if stop_after_tool:
-            force_text = True  # next LLM call must produce text, not a tool call
-            messages.append({
-                "role": "user",
-                "content": "Present ALL the options from the tool result as a numbered list. Include every item. Do not summarize or skip any.",
-            })
-            continue
+            # Format the clarification list directly in Python — never trust LLM formatting
+            try:
+                parsed_result = json.loads(result)
+                options = parsed_result.get("options", [])
+                ctype = parsed_result.get("clarification_needed", "")
+                line_num = parsed_result.get("line_number", "")
+                agency = parsed_result.get("agency_name", "")
+
+                if ctype == "agency":
+                    intro = f"קו {line_num} קיים אצל מספר מפעילים. בחר מפעיל:"
+                else:
+                    intro = f"קו {line_num} של {agency} קיים במספר מסלולים. בחר מסלול:"
+
+                lines = [intro, ""]
+                for opt in options:
+                    lines.append(f"{opt['option_number']}. {opt['label']}")
+                lines.append(f"\nהזן מספר בין 1 ל-{len(options)}.")
+                answer = "\n".join(lines)
+            except Exception:
+                answer = "Please choose an option from the list above."
+
+            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": answer}
+            return
 
     yield {"status": "done", "log": list(log), "coords": list(coords), "answer": "Max steps reached"}
