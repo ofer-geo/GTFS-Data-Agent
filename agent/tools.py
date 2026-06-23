@@ -127,7 +127,7 @@ def get_line_variants(line_number: str, agency_name: str = None) -> str:
             options = [
                 {
                     "option_number": i,
-                    "label": " / ".join(g["route_long_names"]),
+                    "label": g["route_long_names"][0] if g["route_long_names"] else str(route_code),
                     "route_code_5_digits": g["route_code_5_digits"],
                     "route_ids": g["route_ids"],
                 }
