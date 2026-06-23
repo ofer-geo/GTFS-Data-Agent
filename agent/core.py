@@ -185,8 +185,8 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
                 log.append({"type": "retry", "text": "model answered without calling any tool - retrying"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
                 messages.append({"role": "user", "content":
-                    "You have NOT called any tool yet. Call run_sql() or get_schema() "
-                    "to look up the answer — do not answer from memory."})
+                    "You have NOT called any tool yet. First call run_sql() to query the "
+                    "database, then present your findings to the user."})
                 continue
 
             coords += extract_coords(content)
