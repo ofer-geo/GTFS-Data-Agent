@@ -43,6 +43,10 @@ def get_messages(history) -> list:
     return [{"role": "system", "content": system}] + list(history)
 
 
+def _is_hebrew(text: str) -> bool:
+    return any("א" <= c <= "ת" for c in text)
+
+
 def extract_coords(text: str) -> list:
     coords = []
     for block in re.findall(r'\{[^{}]+\}', text):
@@ -262,10 +266,17 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
                 ""
             )
 
-            answer = f"זיהיתי: קו {line_num} של {agency}"
-            if route_desc:
-                answer += f" — {route_desc}"
-            answer += f".\n\nאין לי עדיין כלי לענות על: \"{original_q}\"."
+            hebrew = _is_hebrew(original_q)
+            if hebrew:
+                answer = f"זיהיתי: קו {line_num} של {agency}"
+                if route_desc:
+                    answer += f" — {route_desc}"
+                answer += f".\n\nאין לי עדיין כלי לענות על: \"{original_q}\"."
+            else:
+                answer = f"Identified: line {line_num} operated by {agency}"
+                if route_desc:
+                    answer += f" — {route_desc}"
+                answer += f'.\n\nI don\'t yet have the tool to answer: "{original_q}".'
 
             yield {"status": "done", "log": list(log), "coords": list(coords), "answer": answer}
             return
@@ -278,15 +289,22 @@ def react_agent(history, max_steps: int = 15, stop_event=None):
                 line_num = last_parsed.get("line_number", "")
                 agency = last_parsed.get("agency_name", "")
 
+                original_q = next(
+                    (m["content"] for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                    ""
+                )
+                hebrew = _is_hebrew(original_q)
+
                 if ctype == "agency":
-                    intro = f"קו {line_num} קיים אצל מספר מפעילים. בחר מפעיל:"
+                    intro = f"קו {line_num} קיים אצל מספר מפעילים. בחר מפעיל:" if hebrew else f"Line {line_num} is operated by multiple agencies. Choose one:"
                 else:
-                    intro = f"קו {line_num} של {agency} קיים במספר מסלולים. בחר מסלול:"
+                    intro = f"קו {line_num} של {agency} קיים במספר מסלולים. בחר מסלול:" if hebrew else f"Line {line_num} ({agency}) has multiple routes. Choose one:"
 
                 lines = [intro, ""]
                 for opt in options:
                     lines.append(f"{opt['option_number']}. {opt['label']}")
-                lines.append(f"\nהזן מספר בין 1 ל-{len(options)}.")
+                n = len(options)
+                lines.append(f"\nהזן מספר בין 1 ל-{n}." if hebrew else f"\nEnter a number between 1 and {n}.")
                 answer = "\n".join(lines)
             except Exception:
                 answer = "Please choose an option from the list above."
