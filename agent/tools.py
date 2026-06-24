@@ -208,6 +208,64 @@ def select_option(option_number: int) -> str:
     return json.dumps({"error": "No pending selection. Ask the user a question first."})
 
 
+def get_line_stops(route_ids: list) -> str:
+    """
+    Get ordered stops for each direction of a line.
+    Pass the route_ids list from the selected_line result.
+    Routes sharing the same 5-digit code are the same line in different directions.
+    Returns stops grouped by direction, ordered by stop_sequence.
+    """
+    if _conn is None:
+        return "Error: GTFS database not loaded yet."
+    try:
+        if not route_ids:
+            return "Error: route_ids list is empty."
+
+        directions = []
+        for route_id in route_ids:
+            rows = _conn.execute("""
+                SELECT
+                    t.direction_id,
+                    t.trip_headsign,
+                    s.stop_name,
+                    s.stop_lat,
+                    s.stop_lon,
+                    st.stop_sequence
+                FROM stop_times st
+                JOIN stops s ON st.stop_id = s.stop_id
+                JOIN trips t ON st.trip_id = t.trip_id
+                WHERE t.route_id = ?
+                  AND st.trip_id = (
+                      SELECT trip_id FROM trips WHERE route_id = ? LIMIT 1
+                  )
+                ORDER BY st.stop_sequence
+            """, [route_id, route_id]).fetchall()
+
+            if not rows:
+                continue
+
+            stops = [
+                {"sequence": r[5], "stop_name": r[2], "lat": r[3], "lon": r[4]}
+                for r in rows
+            ]
+            directions.append({
+                "route_id": route_id,
+                "direction_id": rows[0][0],
+                "headsign": rows[0][1],
+                "stops_count": len(stops),
+                "first_stop": stops[0]["stop_name"],
+                "last_stop": stops[-1]["stop_name"],
+                "stops": stops,
+            })
+
+        if not directions:
+            return "No stops found for the given route_ids."
+
+        return json.dumps(directions, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def run_sql(query: str) -> str:
     if _conn is None:
         return "Error: GTFS database not loaded yet."
@@ -229,6 +287,7 @@ tools_map = {
     "get_schema": get_schema,
     "get_line_variants": get_line_variants,
     "select_option": select_option,
+    "get_line_stops": get_line_stops,
 }
 
 # ---- Tools schema ----
@@ -265,6 +324,29 @@ TOOLS_SCHEMA = [
                     },
                 },
                 "required": ["line_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_line_stops",
+            "description": (
+                "Get ordered stops for each direction of an identified line. "
+                "Call this after the line is uniquely identified (can_proceed=true). "
+                "Pass the route_ids list from selected_line. "
+                "Returns stops per direction with stop_name, sequence, first_stop, last_stop, stops_count."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "route_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of route_id integers from selected_line.route_ids",
+                    }
+                },
+                "required": ["route_ids"],
             },
         },
     },

@@ -263,13 +263,23 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             if stop_after_tool or can_proceed:
                 break
 
-        # --- Line identified: let LLM write the natural response ---
+        # --- Line identified: inject route_ids and let loop continue ---
         if can_proceed:
-            llm_resp = _call_llm(messages, tool_choice="none")
-            content, _ = _parse_response(llm_resp)
-            coords += extract_coords(content)
-            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": content}
-            return
+            selected = last_parsed.get("selected_line", {})
+            route_ids = selected.get("route_ids", [])
+            agency = last_parsed.get("agency_name") or selected.get("agency_name", "")
+            line_num = last_parsed.get("line_number", "")
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"Line {line_num} of {agency} is now uniquely identified. "
+                    f"route_ids = {route_ids}. "
+                    f"Use get_line_stops(route_ids={route_ids}) to answer stop questions. "
+                    f"Each direction is a separate route_id. Routes with the same 5-digit code are the same line in opposite directions."
+                ),
+            })
+            can_proceed = False
+            continue
 
         # --- Clarification needed: Python builds the numbered list, LLM writes the response ---
         if stop_after_tool:

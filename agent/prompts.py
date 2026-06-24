@@ -25,8 +25,12 @@ Step 2 — Read the result:
     Ask the user to choose one route.
 
   If can_proceed = true:
-    The line is uniquely identified. Answer the user's question using the data in selected_line.
-    If you need a tool you don't have yet, say so clearly and naturally.
+    The line is uniquely identified. The system will inject the route_ids.
+    - For stop questions (first stop, last stop, Nth stop, how many stops, list of stops):
+      Call get_line_stops(route_ids) to get the stops.
+      The result contains one entry per direction with: stops_count, first_stop, last_stop, headsign, and full stops list.
+      Answer for each direction separately. Routes sharing the same 5-digit code in route_desc are the same line in opposite directions.
+    - For other questions: answer from the identified line data.
 
 Step 3 — When the user replies with a number:
   Call select_option(option_number). Do not interpret the number yourself.
