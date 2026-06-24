@@ -297,17 +297,35 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 )
                 hebrew = _is_hebrew(original_q)
 
-                if ctype == "agency":
+                OPERATOR_KEYWORDS = {"operator", "agency", "agencies", "who runs", "who operates", "operated by", "מפעיל", "חברה", "מפעילים"}
+                is_operator_question = any(kw in original_q.lower() for kw in OPERATOR_KEYWORDS)
+
+                if ctype == "agency" and is_operator_question:
+                    # The list of agencies IS the answer — don't ask to choose
+                    if hebrew:
+                        intro = f"קו {line_num} מופעל על ידי המפעילים הבאים:"
+                    else:
+                        intro = f"Line {line_num} is operated by the following agencies:"
+                    lines = [intro, ""]
+                    for opt in options:
+                        lines.append(f"• {opt['label']}")
+                    answer = "\n".join(lines)
+                elif ctype == "agency":
                     intro = f"קו {line_num} קיים אצל מספר מפעילים. בחר מפעיל:" if hebrew else f"Line {line_num} is operated by multiple agencies. Choose one:"
+                    lines = [intro, ""]
+                    for opt in options:
+                        lines.append(f"{opt['option_number']}. {opt['label']}")
+                    n = len(options)
+                    lines.append(f"\nהזן מספר בין 1 ל-{n}." if hebrew else f"\nEnter a number between 1 and {n}.")
+                    answer = "\n".join(lines)
                 else:
                     intro = f"קו {line_num} של {agency} קיים במספר מסלולים. בחר מסלול:" if hebrew else f"Line {line_num} ({agency}) has multiple routes. Choose one:"
-
-                lines = [intro, ""]
-                for opt in options:
-                    lines.append(f"{opt['option_number']}. {opt['label']}")
-                n = len(options)
-                lines.append(f"\nהזן מספר בין 1 ל-{n}." if hebrew else f"\nEnter a number between 1 and {n}.")
-                answer = "\n".join(lines)
+                    lines = [intro, ""]
+                    for opt in options:
+                        lines.append(f"{opt['option_number']}. {opt['label']}")
+                    n = len(options)
+                    lines.append(f"\nהזן מספר בין 1 ל-{n}." if hebrew else f"\nEnter a number between 1 and {n}.")
+                    answer = "\n".join(lines)
             except Exception:
                 answer = "Please choose an option from the list above."
 
