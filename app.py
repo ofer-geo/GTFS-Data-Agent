@@ -60,7 +60,7 @@ def _agent_thread(question, context, result_queue, stop_event, provider):
 
 PROVIDERS = {
     "groq":   "Groq (llama-3.3-70b-versatile)",
-    "google": "Google (gemini-2.0-flash)",
+    "google": "Google (gemini-2.5-flash)",
     "openai": "OpenAI (gpt-4o-mini)",
 }
 
@@ -69,7 +69,7 @@ with st.sidebar:
     st.header("Israel Transit Agent 🚍")
     st.caption("Ask about Israeli public transport schedules (GTFS data).")
 
-    default_provider = os.environ.get("PROVIDER", "groq")
+    default_provider = os.environ.get("PROVIDER", "google")
     provider_keys = list(PROVIDERS.keys())
     selected_provider = st.selectbox(
         "LLM Provider",

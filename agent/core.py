@@ -72,7 +72,8 @@ def extract_coords(text: str) -> list:
 
 
 def _call_llm(messages, tool_choice="auto"):
-    """Call the LLM using the correct SDK for the active provider."""
+    if PROVIDER == "google":
+        time.sleep(6)  # Stay under Gemini free-tier 10 RPM limit
     if PROVIDER == "anthropic":
         return client.messages.create(
             model=MODEL,
@@ -82,13 +83,10 @@ def _call_llm(messages, tool_choice="auto"):
             tools=ANTHROPIC_TOOLS,
         )
     else:
-        return client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS_SCHEMA,
-            tool_choice=tool_choice,
-            parallel_tool_calls=False,
-        )
+        kwargs = dict(model=MODEL, messages=messages, tools=TOOLS_SCHEMA, tool_choice=tool_choice)
+        if PROVIDER != "google":
+            kwargs["parallel_tool_calls"] = False
+        return client.chat.completions.create(**kwargs)
 
 
 def _parse_response(response):
@@ -178,9 +176,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 continue
 
             if status in (413, 429) or "rate_limit" in es or "too large" in es.lower() or "overloaded" in es.lower():
-                log.append({"type": "retry", "text": "rate limit - waiting 20s"})
+                wait_s = 60 if PROVIDER == "google" else 20
+                log.append({"type": "retry", "text": f"rate limit - waiting {wait_s}s"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
-                for _ in range(40):  # 40 × 0.5s = 20s, interruptible
+                for _ in range(wait_s * 2):  # 0.5s steps, interruptible
                     if stop_event and stop_event.is_set():
                         break
                     time.sleep(0.5)
@@ -212,7 +211,9 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     log.append({"type": "retry", "text": "model answered without calling any tool - retrying"})
                     yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
                     messages.append({"role": "user", "content":
-                        "You have NOT called any tool yet. Call get_line_variants() first."})
+                        "You have NOT called any tool yet. "
+                        "For questions about a specific line number, call get_line_variants() first. "
+                        "For general database questions, call run_sql() directly."})
                     continue
 
             coords += extract_coords(content)
@@ -269,13 +270,16 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             route_ids = selected.get("route_ids", [])
             agency = last_parsed.get("agency_name") or selected.get("agency_name", "")
             line_num = last_parsed.get("line_number", "")
+            ids_str = ", ".join(str(r) for r in route_ids)
             messages.append({
                 "role": "user",
                 "content": (
                     f"Line {line_num} of {agency} is now uniquely identified. "
                     f"route_ids = {route_ids}. "
-                    f"Use get_line_stops(route_ids={route_ids}) to answer stop questions. "
-                    f"Each direction is a separate route_id. Routes with the same 5-digit code are the same line in opposite directions."
+                    f"These route_ids are the same line in different directions — always include all of them. "
+                    f"Now call run_sql() to answer the user's question. "
+                    f"Filter by: WHERE route_id IN ({ids_str}). "
+                    f"For stop questions: join stop_times → stops, use (SELECT trip_id FROM trips WHERE route_id = X LIMIT 1) per route_id, ORDER BY stop_sequence."
                 ),
             })
             can_proceed = False
