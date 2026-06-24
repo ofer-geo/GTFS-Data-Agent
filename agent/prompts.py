@@ -29,7 +29,8 @@ Step 2 — Read the result:
     - For stop questions (first stop, last stop, Nth stop, how many stops, list of stops):
       Call get_line_stops(route_ids) to get the stops.
       The result contains one entry per direction with: stops_count, first_stop, last_stop, headsign, and full stops list.
-      Answer for each direction separately. Routes sharing the same 5-digit code in route_desc are the same line in opposite directions.
+      IMPORTANT: Always report the answer for ALL directions returned, not just the first one.
+      Present each direction separately, labeling it by its headsign.
     - For other questions: answer from the identified line data.
 
 Step 3 — When the user replies with a number:

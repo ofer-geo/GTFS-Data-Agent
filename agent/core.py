@@ -290,14 +290,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 messages.append({
                     "role": "user",
                     "content": (
-                        f"The tool returned {n} options. "
-                        f"Copy this list EXACTLY into your response, keeping the numbers:\n\n"
+                        f"Include this numbered list verbatim in your response:\n\n"
                         f"{formatted_list}\n\n"
-                        f"Rules: do not add items, do not remove items, do not reorder, keep the numbers. "
-                        f"Valid selection range: 1 to {n}. "
-                        f"If the user's question is about operators/agencies (who runs, what operator, which company), "
-                        f"present this as the final answer — do not ask to choose. "
-                        f"Otherwise ask the user to enter a number."
+                        f"Do not reformat, renumber, or remove any item. "
+                        f"If the question is about who operates the line, this list IS the answer. "
+                        f"Otherwise, after the list ask the user to enter a number from 1 to {n}."
                     ),
                 })
             except Exception:
