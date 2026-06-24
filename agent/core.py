@@ -196,12 +196,19 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 continue
 
             if tool_calls_made == 0:
-                log.append({"type": "retry", "text": "model answered without calling any tool - retrying"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
-                messages.append({"role": "user", "content":
-                    "You have NOT called any tool yet. First call run_sql() to query the "
-                    "database, then present your findings to the user."})
-                continue
+                # Only force a tool call if the question is about transport data
+                transport_keywords = {"line", "stop", "route", "bus", "operator", "agency", "קו", "תחנה", "מפעיל"}
+                first_user_msg = next(
+                    (m["content"] for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                    ""
+                )
+                is_transport = any(kw in first_user_msg.lower() for kw in transport_keywords)
+                if is_transport:
+                    log.append({"type": "retry", "text": "model answered without calling any tool - retrying"})
+                    yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
+                    messages.append({"role": "user", "content":
+                        "You have NOT called any tool yet. Call get_line_variants() first."})
+                    continue
 
             coords += extract_coords(content)
             yield {"status": "done", "log": list(log), "coords": list(coords), "answer": content}
