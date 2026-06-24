@@ -4,6 +4,9 @@ import threading
 import queue
 import time
 import json
+import os
+import sys
+import importlib
 
 st.set_page_config(
     page_title="Israel Transit Agent",
@@ -36,8 +39,13 @@ for key, default in {
         st.session_state[key] = default
 
 
-def _agent_thread(question, context, result_queue, stop_event):
+def _agent_thread(question, context, result_queue, stop_event, provider):
     """Run the agent in a background thread, pushing updates into a queue."""
+    import os, sys, importlib
+    os.environ["PROVIDER"] = provider
+    for mod_name in ["config", "agent.utils", "agent.core"]:
+        if mod_name in sys.modules:
+            importlib.reload(sys.modules[mod_name])
     from agent.core import react_agent
     try:
         for update in react_agent(question, context=context, stop_event=stop_event):
@@ -50,10 +58,31 @@ def _agent_thread(question, context, result_queue, stop_event):
     result_queue.put(None)  # sentinel: agent finished
 
 
+PROVIDERS = {
+    "groq":   "Groq (llama-3.3-70b-versatile)",
+    "google": "Google (gemini-2.0-flash)",
+    "openai": "OpenAI (gpt-4o-mini)",
+}
+
 # --- Sidebar ---
 with st.sidebar:
     st.header("Israel Transit Agent 🚍")
     st.caption("Ask about Israeli public transport schedules (GTFS data).")
+
+    default_provider = os.environ.get("PROVIDER", "groq")
+    provider_keys = list(PROVIDERS.keys())
+    selected_provider = st.selectbox(
+        "LLM Provider",
+        provider_keys,
+        index=provider_keys.index(st.session_state.get("provider", default_provider)),
+        format_func=lambda k: PROVIDERS[k],
+        disabled=st.session_state.agent_running,
+    )
+    if selected_provider != st.session_state.get("provider", default_provider):
+        st.session_state["provider"] = selected_provider
+        st.rerun()
+
+    st.divider()
 
     st.markdown("### Example questions")
     EXAMPLES = [
@@ -170,9 +199,10 @@ else:
         st.session_state.agent_running = True
 
         # Launch background thread
+        active_provider = st.session_state.get("provider", os.environ.get("PROVIDER", "groq"))
         t = threading.Thread(
             target=_agent_thread,
-            args=(question, context, st.session_state.agent_queue, st.session_state.stop_event),
+            args=(question, context, st.session_state.agent_queue, st.session_state.stop_event, active_provider),
             daemon=True,
         )
         t.start()
