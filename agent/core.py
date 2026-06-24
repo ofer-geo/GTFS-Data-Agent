@@ -147,10 +147,6 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
               pass None or [] for a fresh conversation
     """
     history = list(context or []) + [{"role": "user", "content": question}]
-    """
-    ReAct loop. Yields status dicts so app.py can update the UI in real time.
-    Accepts either a plain question string or a full conversation history list.
-    """
     print(f"[Agent] New query → provider={PROVIDER!r} model={MODEL!r}")
     messages = get_messages(history)
     log, coords = [], []
