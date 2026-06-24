@@ -270,8 +270,13 @@ def get_line_stops(route_ids: list) -> str:
 def run_sql(query: str) -> str:
     if _conn is None:
         return "Error: GTFS database not loaded yet."
+    stripped = query.strip()
+    if not stripped.upper().startswith("SELECT"):
+        return "Error: Only SELECT queries are allowed."
+    if "LIMIT" not in stripped.upper():
+        stripped = stripped.rstrip(";") + f" LIMIT {MAX_ROWS}"
     try:
-        rel = _conn.execute(query)
+        rel = _conn.execute(stripped)
         cols = [desc[0] for desc in rel.description]
         rows = rel.fetchmany(MAX_ROWS)
         records = [dict(zip(cols, row)) for row in rows]
@@ -288,7 +293,8 @@ tools_map = {
     "get_schema": get_schema,
     "get_line_variants": get_line_variants,
     "select_option": select_option,
-    "get_line_stops": get_line_stops,
+    "get_line_stops": get_line_stops,  # kept for internal use
+    "run_sql": run_sql,
 }
 
 # ---- Tools schema ----
@@ -331,29 +337,6 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
-            "name": "get_line_stops",
-            "description": (
-                "Get ordered stops for each direction of an identified line. "
-                "Call this after the line is uniquely identified (can_proceed=true). "
-                "Pass the route_ids list from selected_line. "
-                "Returns stops per direction with stop_name, sequence, first_stop, last_stop, stops_count."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "route_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "List of route_id integers from selected_line.route_ids",
-                    }
-                },
-                "required": ["route_ids"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "select_option",
             "description": (
                 "Call this when the user replies with a number after a numbered list of agencies or routes. "
@@ -368,6 +351,27 @@ TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["option_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_sql",
+            "description": (
+                "Execute a SELECT query on the GTFS database. "
+                "Use this after the line is identified (can_proceed=true) to answer any question about stops, schedules, routes, agencies, etc. "
+                "Can also be called directly for general database questions that don't require line disambiguation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "A valid SQL SELECT statement. Only SELECT is allowed.",
+                    }
+                },
+                "required": ["query"],
             },
         },
     },

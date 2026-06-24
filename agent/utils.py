@@ -19,6 +19,7 @@ def get_client():
         return OpenAI(
             api_key=GOOGLE_API_KEY,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            default_headers={"x-goog-api-key": GOOGLE_API_KEY},
         )
     else:
         raise ValueError(f"Unknown provider: '{PROVIDER}'. Choose groq, openai, anthropic, or google.")
