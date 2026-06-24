@@ -230,7 +230,8 @@ def get_line_stops(route_ids: list) -> str:
                     s.stop_name,
                     s.stop_lat,
                     s.stop_lon,
-                    st.stop_sequence
+                    st.stop_sequence,
+                    s.stop_code
                 FROM stop_times st
                 JOIN stops s ON st.stop_id = s.stop_id
                 JOIN trips t ON st.trip_id = t.trip_id
@@ -245,7 +246,7 @@ def get_line_stops(route_ids: list) -> str:
                 continue
 
             stops = [
-                {"sequence": r[5], "stop_name": r[2], "lat": r[3], "lon": r[4]}
+                {"sequence": r[5], "stop_name": r[2], "stop_code": r[6], "lat": r[3], "lon": r[4]}
                 for r in rows
             ]
             directions.append({
