@@ -43,10 +43,6 @@ def get_messages(history) -> list:
     return [{"role": "system", "content": system}] + list(history)
 
 
-def _is_hebrew(text: str) -> bool:
-    return any("א" <= c <= "ת" for c in text)
-
-
 def extract_coords(text: str) -> list:
     coords = []
     for block in re.findall(r'\{[^{}]+\}', text):
@@ -255,81 +251,37 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             if stop_after_tool or can_proceed:
                 break
 
-        # --- Line identified: say what was found and what can't be answered yet ---
+        # --- Line identified: let LLM write the natural response ---
         if can_proceed:
-            selected = last_parsed.get("selected_line", {})
-            agency = last_parsed.get("agency_name") or selected.get("agency_name", "")
-            line_num = last_parsed.get("line_number", "")
-            route_names = selected.get("route_long_names", [])
-            route_desc = route_names[0] if route_names else selected.get("route_long_name", "")
-
-            original_q = next(
-                (m["content"] for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)),
-                ""
-            )
-
-            hebrew = _is_hebrew(original_q)
-            if hebrew:
-                answer = f"זיהיתי: קו {line_num} של {agency}"
-                if route_desc:
-                    answer += f" — {route_desc}"
-                answer += f".\n\nאין לי עדיין כלי לענות על: \"{original_q}\"."
-            else:
-                answer = f"Identified: line {line_num} operated by {agency}"
-                if route_desc:
-                    answer += f" — {route_desc}"
-                answer += f'.\n\nI don\'t yet have the tool to answer: "{original_q}".'
-
-            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": answer}
+            llm_resp = _call_llm(messages, tool_choice="none")
+            content, _ = _parse_response(llm_resp)
+            coords += extract_coords(content)
+            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": content}
             return
 
-        # --- Clarification needed: format numbered list directly in Python ---
+        # --- Clarification needed: Python builds the numbered list, LLM writes the response ---
         if stop_after_tool:
             try:
                 options = last_parsed.get("options", [])
-                ctype = last_parsed.get("clarification_needed", "")
-                line_num = last_parsed.get("line_number", "")
-                agency = last_parsed.get("agency_name", "")
-
-                original_q = next(
-                    (m["content"] for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)),
-                    ""
-                )
-                hebrew = _is_hebrew(original_q)
-
-                OPERATOR_KEYWORDS = {"operator", "agency", "agencies", "who runs", "who operates", "operated by", "מפעיל", "חברה", "מפעילים"}
-                is_operator_question = any(kw in original_q.lower() for kw in OPERATOR_KEYWORDS)
-
-                if ctype == "agency" and is_operator_question:
-                    # The list of agencies IS the answer — don't ask to choose
-                    if hebrew:
-                        intro = f"קו {line_num} מופעל על ידי המפעילים הבאים:"
-                    else:
-                        intro = f"Line {line_num} is operated by the following agencies:"
-                    lines = [intro, ""]
-                    for opt in options:
-                        lines.append(f"• {opt['label']}")
-                    answer = "\n".join(lines)
-                elif ctype == "agency":
-                    intro = f"קו {line_num} קיים אצל מספר מפעילים. בחר מפעיל:" if hebrew else f"Line {line_num} is operated by multiple agencies. Choose one:"
-                    lines = [intro, ""]
-                    for opt in options:
-                        lines.append(f"{opt['option_number']}. {opt['label']}")
-                    n = len(options)
-                    lines.append(f"\nהזן מספר בין 1 ל-{n}." if hebrew else f"\nEnter a number between 1 and {n}.")
-                    answer = "\n".join(lines)
-                else:
-                    intro = f"קו {line_num} של {agency} קיים במספר מסלולים. בחר מסלול:" if hebrew else f"Line {line_num} ({agency}) has multiple routes. Choose one:"
-                    lines = [intro, ""]
-                    for opt in options:
-                        lines.append(f"{opt['option_number']}. {opt['label']}")
-                    n = len(options)
-                    lines.append(f"\nהזן מספר בין 1 ל-{n}." if hebrew else f"\nEnter a number between 1 and {n}.")
-                    answer = "\n".join(lines)
+                n = len(options)
+                formatted_list = "\n".join(f"{opt['option_number']}. {opt['label']}" for opt in options)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"The tool returned {n} options. "
+                        f"Use EXACTLY this numbered list in your response — do not add, remove, or reorder items:\n\n"
+                        f"{formatted_list}\n\n"
+                        f"Valid selection range: 1 to {n}. "
+                        f"If the user's question is about operators/agencies, present this as the answer. "
+                        f"Otherwise ask the user to choose a number."
+                    ),
+                })
             except Exception:
-                answer = "Please choose an option from the list above."
+                pass
 
-            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": answer}
+            llm_resp = _call_llm(messages, tool_choice="none")
+            content, _ = _parse_response(llm_resp)
+            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": content}
             return
 
     yield {"status": "done", "log": list(log), "coords": list(coords), "answer": "Max steps reached"}
