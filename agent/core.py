@@ -30,12 +30,17 @@ def get_messages(history) -> list:
 
     system = SYSTEM_PROMPT
     if pending:
+        options = selection_state.get("agencies", []) if pending == "agency" else [
+            g["route_long_names"][0] if g.get("route_long_names") else ""
+            for g in selection_state.get("grouped_lines", [])
+        ]
+        options_text = "\n".join(f"{i+1}. {o}" for i, o in enumerate(options))
         system += (
-            f"\n\n⚠️ CURRENT STATE: You presented a numbered list and are waiting for the user "
-            f"to choose (pending_type='{pending}'). "
-            f"The user's latest message is their selection number. "
-            f"You MUST call select_option(option_number) with that number. "
-            f"Do NOT call get_line_variants again."
+            f"\n\n⚠️ CURRENT STATE: You showed a numbered list and are waiting for the user to choose."
+            f"\nThe list was:\n{options_text}"
+            f"\nThe user's latest message is either a number or a name from this list."
+            f"\nFind the matching number and call select_option(option_number)."
+            f"\nDo NOT call get_line_variants. Do NOT pass agency names as arguments."
         )
 
     if PROVIDER == "anthropic":
@@ -276,11 +281,13 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     "role": "user",
                     "content": (
                         f"The tool returned {n} options. "
-                        f"Use EXACTLY this numbered list in your response — do not add, remove, or reorder items:\n\n"
+                        f"Copy this list EXACTLY into your response, keeping the numbers:\n\n"
                         f"{formatted_list}\n\n"
+                        f"Rules: do not add items, do not remove items, do not reorder, keep the numbers. "
                         f"Valid selection range: 1 to {n}. "
-                        f"If the user's question is about operators/agencies, present this as the answer. "
-                        f"Otherwise ask the user to choose a number."
+                        f"If the user's question is about operators/agencies (who runs, what operator, which company), "
+                        f"present this as the final answer — do not ask to choose. "
+                        f"Otherwise ask the user to enter a number."
                     ),
                 })
             except Exception:
