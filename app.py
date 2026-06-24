@@ -36,11 +36,11 @@ for key, default in {
         st.session_state[key] = default
 
 
-def _agent_thread(history, result_queue, stop_event):
+def _agent_thread(question, context, result_queue, stop_event):
     """Run the agent in a background thread, pushing updates into a queue."""
     from agent.core import react_agent
     try:
-        for update in react_agent(history, stop_event=stop_event):
+        for update in react_agent(question, context=context, stop_event=stop_event):
             result_queue.put(update)
     except Exception as e:
         result_queue.put({
@@ -154,10 +154,11 @@ else:
         with st.chat_message("user"):
             st.markdown(user_input)
 
-        # Build full history for the agent (user + assistant turns)
-        agent_history = [
+        # Build context (all turns except the current one) and extract question
+        question = user_input
+        context = [
             {"role": m["role"], "content": m["content"]}
-            for m in st.session_state["chat_history"]
+            for m in st.session_state["chat_history"][:-1]  # exclude the just-appended user message
         ]
 
         # Reset per-run state
@@ -171,7 +172,7 @@ else:
         # Launch background thread
         t = threading.Thread(
             target=_agent_thread,
-            args=(agent_history, st.session_state.agent_queue, st.session_state.stop_event),
+            args=(question, context, st.session_state.agent_queue, st.session_state.stop_event),
             daemon=True,
         )
         t.start()

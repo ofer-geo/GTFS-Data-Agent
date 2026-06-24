@@ -140,7 +140,13 @@ def _append_tool_result(messages, tool_call_id, func_name, result, anthropic_raw
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": result})
 
 
-def react_agent(history, max_steps: int = 15, stop_event=None):
+def react_agent(question: str, context: list = None, max_steps: int = 15, stop_event=None):
+    """
+    question: the current user message (string)
+    context:  previous conversation turns as [{"role": ..., "content": ...}, ...]
+              pass None or [] for a fresh conversation
+    """
+    history = list(context or []) + [{"role": "user", "content": question}]
     """
     ReAct loop. Yields status dicts so app.py can update the UI in real time.
     Accepts either a plain question string or a full conversation history list.
