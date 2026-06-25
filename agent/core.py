@@ -139,6 +139,49 @@ def _append_tool_result(messages, tool_call_id, func_name, result, anthropic_raw
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": result})
 
 
+def _summarize_tool_result(func_name: str, content: str) -> str:
+    """Condense a tool result to a one-line summary for message history trimming."""
+    if len(content) <= 300:
+        return content
+    try:
+        data = json.loads(content)
+        if func_name == "get_line_stops":
+            dirs = data if isinstance(data, list) else [data]
+            parts = [f"{d.get('headsign', '?')} ({d.get('stops_count', '?')} stops)" for d in dirs]
+            return f"[get_line_stops: {len(dirs)} direction(s) — {'; '.join(parts)}]"
+        elif func_name == "get_line_variants":
+            return (f"[get_line_variants: line={data.get('line_number')}, "
+                    f"agency={data.get('agency_name')}, "
+                    f"can_proceed={data.get('can_proceed')}, "
+                    f"clarification_needed={data.get('clarification_needed')!r}]")
+        elif func_name == "select_option":
+            return f"[select_option: can_proceed={data.get('can_proceed')}, agency={data.get('agency_name')}]"
+        elif func_name == "run_sql":
+            rows = data if isinstance(data, list) else []
+            return f"[run_sql: {len(rows)} row(s) returned]"
+        else:
+            return f"[{func_name}: result summarized ({len(content)} chars)]"
+    except (json.JSONDecodeError, TypeError):
+        return f"[{func_name}: {content[:150]}...]"
+
+
+def _trim_tool_results(messages: list, tool_call_names: dict) -> None:
+    """Replace tool result content in-place with short summaries."""
+    for m in messages:
+        if m.get("role") == "tool":
+            func_name = tool_call_names.get(m.get("tool_call_id", ""), "unknown")
+            content = m.get("content", "")
+            if isinstance(content, str):
+                m["content"] = _summarize_tool_result(func_name, content)
+        elif m.get("role") == "user" and isinstance(m.get("content"), list):
+            for block in m["content"]:
+                if block.get("type") == "tool_result":
+                    func_name = tool_call_names.get(block.get("tool_use_id", ""), "unknown")
+                    content = block.get("content", "")
+                    if isinstance(content, str):
+                        block["content"] = _summarize_tool_result(func_name, content)
+
+
 def react_agent(question: str, context: list = None, max_steps: int = 15, stop_event=None):
     """
     question: the current user message (string)
@@ -152,7 +195,12 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
     tool_calls_made = 0
     MAX_OBS_CHARS = 3000
     current_response = None
+    tool_call_names = {}  # call_id → func_name, used for trimming
     for step in range(max_steps):
+
+        # --- Trim previous tool results to summaries before next LLM call ---
+        if step > 0:
+            _trim_tool_results(messages, tool_call_names)
 
         # --- Check stop request ---
         if stop_event and stop_event.is_set():
@@ -231,6 +279,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
         for tool_call in tool_calls:
             func_name = tool_call.function.name
+            tool_call_names[tool_call.id] = func_name
             args = json.loads(tool_call.function.arguments) or {}
 
             if func_name == "get_line_variants":
