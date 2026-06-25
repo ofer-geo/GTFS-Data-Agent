@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import pydeck as pdk
 import threading
 import queue
 import time
@@ -13,6 +14,74 @@ st.set_page_config(
     page_icon="🚌",
     layout="wide",
 )
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+/* Page title a touch bigger and tighter */
+h1 { font-weight: 800 !important; letter-spacing: -0.02em; }
+
+/* Chat message bubbles: more breathing room + soft cards */
+[data-testid="stChatMessage"] {
+    padding: 14px 18px;
+    border-radius: 14px;
+    margin-bottom: 12px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    border: 1px solid #ececf1;
+}
+
+/* User messages: subtle blue tint so you can tell who's who */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
+    background: #eef4ff;
+    border-color: #dce7fb;
+}
+
+/* Assistant messages: clean white */
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
+    background: #ffffff;
+}
+
+/* Sidebar example buttons: clickable hover feel */
+[data-testid="stSidebar"] .stButton button {
+    border-radius: 9px;
+    border: 1px solid #e3e6ea;
+    transition: all .12s ease;
+    text-align: left;
+}
+[data-testid="stSidebar"] .stButton button:hover {
+    border-color: #3b82f6;
+    color: #3b82f6;
+    background: #f0f6ff;
+}
+
+/* Chat input: rounder, softer */
+[data-testid="stChatInput"] {
+    border-radius: 12px;
+    border: 1.5px solid #e3e6ea;
+}
+[data-testid="stChatInput"]:focus-within {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px #e8f0fe;
+}
+
+/* Section headers in sidebar: small caps, muted */
+[data-testid="stSidebar"] h3 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #6b7280;
+}
+
+/* Code blocks in the agent log: subtle background */
+[data-testid="stChatMessage"] pre {
+    border-radius: 8px;
+    font-size: 12px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_resource(show_spinner="Loading GTFS data (first run may take a minute)...")
@@ -111,7 +180,57 @@ with st.sidebar:
         st.session_state["chat_history"] = []
         st.rerun()
 
-st.title("Israel Transit Agent")
+st.title("Israel Transit Agent 🚍")
+
+# --- Welcome subtitle (homepage only) ---
+if not st.session_state.get("chat_history"):
+    st.markdown(
+        "<p style='font-size:18px; color:#4b5563; margin-top:-8px; margin-bottom:18px;'>"
+        "👋 Ask me about bus stops, routes, or operators across Israel — try an example on the left."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+# --- Persistent map (collapsible, always available) ---
+with st.expander("🗺️ Map", expanded=True):
+    latest_coords = st.session_state.get("agent_coords", [])
+
+    if latest_coords:
+        df = pd.DataFrame(latest_coords)
+        mid_lat = df["lat"].mean()
+        mid_lon = df["lon"].mean()
+
+        scatter = pdk.Layer(
+            "ScatterplotLayer",
+            data=df,
+            get_position="[lon, lat]",
+            get_fill_color="[59, 130, 246, 200]",   # blue stops
+            get_radius=120,
+            pickable=True,
+        )
+
+        path_data = [{"path": df[["lon", "lat"]].values.tolist()}]
+        path = pdk.Layer(
+            "PathLayer",
+            data=path_data,
+            get_path="path",
+            get_color="[239, 68, 68]",              # red route line
+            get_width=40,
+            width_min_pixels=3,
+        )
+
+        st.pydeck_chart(pdk.Deck(
+            layers=[path, scatter],
+            initial_view_state=pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=12),
+            map_style="light",
+            tooltip={"text": "{label}"},
+        ), height=480)
+    else:
+        # Default homepage view: Israel, no route yet
+        st.pydeck_chart(pdk.Deck(
+            initial_view_state=pdk.ViewState(latitude=31.7, longitude=35.0, zoom=7.5),
+            map_style="light",
+        ), height=480)
 
 # --- Display past messages ---
 for msg in st.session_state["chat_history"]:
@@ -187,7 +306,7 @@ else:
         question = user_input
         context = [
             {"role": m["role"], "content": m["content"]}
-            for m in st.session_state["chat_history"][:-1]  # exclude the just-appended user message
+            for m in st.session_state["chat_history"][:-1]
         ]
 
         # Reset per-run state
