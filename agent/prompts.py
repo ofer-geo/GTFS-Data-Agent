@@ -65,14 +65,19 @@ EXAMPLE — Ordered stops for a specific route_id:
    - can_proceed=true: the line is uniquely identified. You have the route_ids. Go to Phase 2.
 3. When the user replies with a number, call select_option(option_number). Do not interpret the number yourself.
 
-**Phase 2 — Answer with SQL**
+**Phase 2 — Answer using tools (tools first, SQL only as last resort)**
 
-Once you have route_ids, call run_sql() with a SQL query:
-- Always filter by ALL route_ids: WHERE route_id IN (id1, id2, ...)
-- The route_ids represent the same line in different directions — include all of them and report each direction separately.
-- For stop questions: join stop_times → stops, pick one representative trip per route_id using (SELECT trip_id FROM trips WHERE route_id = X LIMIT 1), order by stop_sequence.
-- For schedule questions: join trips → stop_times → calendar, filter by day columns.
-- If the user asks only about one direction (e.g. "towards Tel Aviv"), filter by trip_headsign or direction_id.
+Once you have route_ids, answer the question using tools in this priority order:
+
+1. **get_line_stops(route_ids)** — use for any stop-related question: first stop, last stop, Nth stop, stop count, full stop list, map of stops. It returns all stops for every direction with sequence, name, code, and coordinates. From this single result you can answer virtually any stop question without SQL.
+
+2. **Combine tools** — if one tool's result gives you data you can use to call another tool, do that before resorting to SQL. Example: use get_line_stops to find a stop name, then run_sql to find other lines at that stop.
+
+3. **run_sql(query)** — use ONLY if the question cannot be answered by the tools above. Examples: schedule/timing questions, finding which lines serve a stop, statistics across the whole network.
+
+For all tool calls after disambiguation:
+- Always include ALL route_ids — they are the same line in different directions.
+- Report results for each direction separately, labelled by headsign.
 
 ### For general database questions (not about a specific line):
 Call run_sql() directly — no need for get_line_variants.

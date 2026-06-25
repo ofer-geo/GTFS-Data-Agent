@@ -277,9 +277,8 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     f"Line {line_num} of {agency} is now uniquely identified. "
                     f"route_ids = {route_ids}. "
                     f"These route_ids are the same line in different directions — always include all of them. "
-                    f"Now call run_sql() to answer the user's question. "
-                    f"Filter by: WHERE route_id IN ({ids_str}). "
-                    f"For stop questions: join stop_times → stops, use (SELECT trip_id FROM trips WHERE route_id = X LIMIT 1) per route_id, ORDER BY stop_sequence."
+                    f"For stop questions call get_line_stops(route_ids={route_ids}). "
+                    f"For other questions call run_sql() filtering by WHERE route_id IN ({ids_str})."
                 ),
             })
             can_proceed = False

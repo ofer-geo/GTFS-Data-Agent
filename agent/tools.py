@@ -293,7 +293,7 @@ tools_map = {
     "get_schema": get_schema,
     "get_line_variants": get_line_variants,
     "select_option": select_option,
-    "get_line_stops": get_line_stops,  # kept for internal use
+    "get_line_stops": get_line_stops,
     "run_sql": run_sql,
 }
 
@@ -357,10 +357,35 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "get_line_stops",
+            "description": (
+                "Get all stops for every direction of an identified line, ordered by stop_sequence. "
+                "Returns stop_name, stop_code, lat, lon, and sequence number for each stop. "
+                "Use this to answer any stop-related question: first stop, last stop, Nth stop, "
+                "total stop count, full stop list, or map of stops. "
+                "Always prefer this tool over run_sql for stop questions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "route_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of route_id integers for the identified line (all directions).",
+                    }
+                },
+                "required": ["route_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_sql",
             "description": (
                 "Execute a SELECT query on the GTFS database. "
-                "Use this after the line is identified (can_proceed=true) to answer any question about stops, schedules, routes, agencies, etc. "
+                "Use this ONLY when the question cannot be answered by get_line_stops or a combination of available tools. "
+                "Examples: schedule/timing questions, finding which lines serve a stop, cross-table queries. "
                 "Can also be called directly for general database questions that don't require line disambiguation."
             ),
             "parameters": {
