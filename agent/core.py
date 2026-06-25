@@ -193,7 +193,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
     messages = get_messages(history)
     log, coords = [], []
     tool_calls_made = 0
-    MAX_OBS_CHARS = 3000
+    MAX_OBS_CHARS = 2000
     current_response = None
     tool_call_names = {}  # call_id → func_name, used for trimming
     for step in range(max_steps):

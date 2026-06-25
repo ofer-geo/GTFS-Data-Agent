@@ -4,7 +4,7 @@ import duckdb
 from collections import defaultdict
 
 _conn: duckdb.DuckDBPyConnection = None
-MAX_ROWS = 100
+MAX_ROWS = 30
 
 # Persists across turns so select_option can map numbers to Hebrew values
 selection_state = {
