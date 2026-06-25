@@ -275,14 +275,38 @@ if st.session_state.agent_running:
         if st.button("⏹ Stop", type="secondary"):
             st.session_state.stop_event.set()
 
-        with st.expander("Agent steps", expanded=True):
-            for i, step in enumerate(st.session_state.agent_log, 1):
+        with st.expander("🤔 Agent steps", expanded=True):
+            for step in st.session_state.agent_log:
                 if step["type"] == "retry":
-                    st.warning(f"{i}. ⟳ {step['text']}")
+                    st.caption(f"⟳ {step['text']}")
                 else:
-                    st.markdown(f"**{i}. {step['tool']}**")
-                    st.code(json.dumps(step["args"], ensure_ascii=False), language="json")
-                    st.text(step["observation"])
+                    tool = step["tool"]
+                    args = step["args"]
+                    obs = step.get("observation", "")
+                    args_str = ", ".join(
+                        f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}"
+                        for k, v in args.items()
+                    )
+                    try:
+                        data = json.loads(obs)
+                        if isinstance(data, list):
+                            obs_short = f"{len(data)} result(s)"
+                        elif isinstance(data, dict):
+                            parts = []
+                            if "can_proceed" in data:
+                                parts.append(f"can_proceed={data['can_proceed']}")
+                            if data.get("agency_name"):
+                                parts.append(f"agency={data['agency_name']}")
+                            if data.get("clarification_needed"):
+                                parts.append(f"needs={data['clarification_needed']}")
+                            if data.get("options_count"):
+                                parts.append(f"{data['options_count']} options")
+                            obs_short = ", ".join(parts) if parts else obs[:80]
+                        else:
+                            obs_short = obs[:80]
+                    except Exception:
+                        obs_short = obs[:80]
+                    st.caption(f"🔧 **{tool}**({args_str}) → {obs_short}")
 
         if st.session_state.agent_answer:
             st.markdown(st.session_state.agent_answer)

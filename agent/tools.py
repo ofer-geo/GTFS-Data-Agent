@@ -222,6 +222,7 @@ def get_line_stops(route_ids: list) -> str:
             return "Error: route_ids list is empty."
 
         directions = []
+        seen = set()  # deduplicate by (direction_id, headsign)
         for route_id in route_ids:
             rows = _conn.execute("""
                 SELECT
@@ -244,6 +245,11 @@ def get_line_stops(route_ids: list) -> str:
 
             if not rows:
                 continue
+
+            key = (rows[0][0], rows[0][1])  # (direction_id, headsign)
+            if key in seen:
+                continue
+            seen.add(key)
 
             stops = [
                 {"sequence": r[5], "stop_name": r[2], "stop_code": r[6], "lat": r[3], "lon": r[4]}
