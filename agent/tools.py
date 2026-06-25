@@ -8,11 +8,13 @@ MAX_ROWS = 30
 
 # Persists across turns so select_option can map numbers to Hebrew values
 selection_state = {
-    "pending_type": None,
+    "pending_type": None,   # "agency", "route", "direction", or None
     "line_number": None,
     "agencies": [],
     "grouped_lines": [],
     "options": [],
+    "directions": [],       # for direction selection
+    "all_route_ids": [],    # for direction selection
 }
 
 
@@ -273,6 +275,68 @@ def get_line_stops(route_ids: list) -> str:
         return f"Error: {e}"
 
 
+def get_line_directions(route_ids: list) -> str:
+    """
+    Get unique directions for an identified line.
+    Called after can_proceed=True to let the user choose a specific direction or all.
+    """
+    if _conn is None:
+        return "Error: GTFS database not loaded yet."
+    try:
+        if not route_ids:
+            return "Error: route_ids list is empty."
+
+        directions = []
+        seen = set()
+
+        for route_id in route_ids:
+            row = _conn.execute("""
+                SELECT t.direction_id, t.trip_headsign, r.route_long_name
+                FROM trips t
+                JOIN routes r ON t.route_id = r.route_id
+                WHERE t.route_id = ?
+                LIMIT 1
+            """, [route_id]).fetchone()
+
+            if not row:
+                continue
+
+            direction_id, headsign, route_long_name = row
+            key = (direction_id, headsign)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            directions.append({
+                "option_number": len(directions) + 1,
+                "route_id": route_id,
+                "direction_id": direction_id,
+                "headsign": headsign,
+                "route_long_name": route_long_name,
+                "label": headsign,
+            })
+
+        all_option_num = len(directions) + 1
+        options = [{"option_number": d["option_number"], "label": d["label"]} for d in directions]
+        options.append({"option_number": all_option_num, "label": "כל הכיוונים"})
+
+        selection_state.update({
+            "pending_type": "direction",
+            "directions": directions,
+            "all_route_ids": list(route_ids),
+        })
+
+        return json.dumps({
+            "clarification_needed": "direction",
+            "directions_count": len(directions),
+            "options": options,
+            "directions": directions,
+            "all_route_ids": list(route_ids),
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def run_sql(query: str) -> str:
     if _conn is None:
         return "Error: GTFS database not loaded yet."
@@ -299,6 +363,7 @@ tools_map = {
     "get_schema": get_schema,
     "get_line_variants": get_line_variants,
     "select_option": select_option,
+    "get_line_directions": get_line_directions,
     "get_line_stops": get_line_stops,
     "run_sql": run_sql,
 }
@@ -357,6 +422,28 @@ TOOLS_SCHEMA = [
                     }
                 },
                 "required": ["option_number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_line_directions",
+            "description": (
+                "After a line is uniquely identified (can_proceed=true), call this BEFORE get_line_stops. "
+                "Returns the available directions (headsigns) with option numbers. "
+                "Present the list to the user and ask which direction they want, or all of them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "route_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of route_id integers for the identified line.",
+                    }
+                },
+                "required": ["route_ids"],
             },
         },
     },

@@ -29,7 +29,24 @@ def get_messages(history) -> list:
     pending = selection_state.get("pending_type")
 
     system = SYSTEM_PROMPT
-    if pending:
+    if pending == "direction":
+        directions = selection_state.get("directions", [])
+        all_route_ids = selection_state.get("all_route_ids", [])
+        dir_text = "\n".join(
+            f"{d['option_number']}. {d['headsign']} (route_id={d['route_id']})"
+            for d in directions
+        )
+        all_num = len(directions) + 1
+        system += (
+            f"\n\n⚠️ CURRENT STATE: You showed the user {len(directions)} directions and are waiting for their choice."
+            f"\nDirections:\n{dir_text}"
+            f"\n{all_num}. כל הכיוונים — route_ids={all_route_ids}"
+            f"\nBased on the user's response, call get_line_stops with:"
+            f"\n- A specific direction: get_line_stops(route_ids=[<that direction's route_id>])"
+            f"\n- All directions: get_line_stops(route_ids={all_route_ids})"
+            f"\nDo NOT call get_line_variants or get_line_directions again."
+        )
+    elif pending:
         options = selection_state.get("agencies", []) if pending == "agency" else [
             g["route_long_names"][0] if g.get("route_long_names") else ""
             for g in selection_state.get("grouped_lines", [])
@@ -328,10 +345,8 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     f"Line {line_num} of {agency} is now uniquely identified. "
                     f"route_ids = {route_ids}. "
                     f"These route_ids are the same line in different directions — always include all of them. "
-                    f"For ANY stop question (first stop, last stop, Nth stop, stop count, stop list): "
-                    f"you MUST call get_line_stops(route_ids={route_ids}). Do NOT use run_sql for stops. "
-                    f"For non-stop questions only: call run_sql() with WHERE route_id IN ({ids_str}). "
-                    f"get_line_stops returns ALL directions — always report every direction in your answer."
+                    f"Call get_line_directions(route_ids={route_ids}) now to show the user "
+                    f"the available directions and ask which one they want (or all)."
                 ),
             })
             can_proceed = False
@@ -342,15 +357,29 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             try:
                 options = last_parsed.get("options", [])
                 n = len(options)
+                clarification_type = last_parsed.get("clarification_needed", "")
                 formatted_list = "\n".join(f"{opt['option_number']}. {opt['label']}" for opt in options)
+
+                if clarification_type == "direction":
+                    after_list = (
+                        f"Ask the user to enter a number from 1 to {n-1} for a specific direction, "
+                        f"or {n} for all directions."
+                    )
+                elif clarification_type == "agency":
+                    after_list = (
+                        f"If the question is purely about who operates the line, this list IS the answer. "
+                        f"Otherwise ask the user to enter a number from 1 to {n}."
+                    )
+                else:
+                    after_list = f"Ask the user to enter a number from 1 to {n}."
+
                 messages.append({
                     "role": "user",
                     "content": (
                         f"Include this numbered list verbatim in your response:\n\n"
                         f"{formatted_list}\n\n"
                         f"Do not reformat, renumber, or remove any item. "
-                        f"If the question is about who operates the line, this list IS the answer. "
-                        f"Otherwise, after the list ask the user to enter a number from 1 to {n}."
+                        f"{after_list}"
                     ),
                 })
             except Exception:
