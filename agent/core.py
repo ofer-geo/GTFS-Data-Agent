@@ -168,6 +168,8 @@ def _summarize_tool_result(func_name: str, content: str) -> str:
 def _trim_tool_results(messages: list, tool_call_names: dict) -> None:
     """Replace tool result content in-place with short summaries."""
     for m in messages:
+        if not isinstance(m, dict):
+            continue
         if m.get("role") == "tool":
             func_name = tool_call_names.get(m.get("tool_call_id", ""), "unknown")
             content = m.get("content", "")
@@ -326,8 +328,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     f"Line {line_num} of {agency} is now uniquely identified. "
                     f"route_ids = {route_ids}. "
                     f"These route_ids are the same line in different directions — always include all of them. "
-                    f"For stop questions call get_line_stops(route_ids={route_ids}). "
-                    f"For other questions call run_sql() filtering by WHERE route_id IN ({ids_str})."
+                    f"For ANY stop question (first stop, last stop, Nth stop, stop count, stop list): "
+                    f"you MUST call get_line_stops(route_ids={route_ids}). Do NOT use run_sql for stops. "
+                    f"For non-stop questions only: call run_sql() with WHERE route_id IN ({ids_str}). "
+                    f"get_line_stops returns ALL directions — always report every direction in your answer."
                 ),
             })
             can_proceed = False
