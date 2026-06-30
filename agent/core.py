@@ -29,7 +29,24 @@ def get_messages(history) -> list:
     pending = selection_state.get("pending_type")
 
     system = SYSTEM_PROMPT
-    if pending:
+    if pending == "direction":
+        directions = selection_state.get("directions", [])
+        all_route_ids = selection_state.get("all_route_ids", [])
+        dir_text = "\n".join(
+            f"{d['option_number']}. {d['headsign']} (route_id={d['route_id']})"
+            for d in directions
+        )
+        all_num = len(directions) + 1
+        system += (
+            f"\n\n⚠️ CURRENT STATE: You showed the user {len(directions)} directions and are waiting for their choice."
+            f"\nDirections:\n{dir_text}"
+            f"\n{all_num}. כל הכיוונים — route_ids={all_route_ids}"
+            f"\nBased on the user's response, call get_line_stops with:"
+            f"\n- A specific direction: get_line_stops(route_ids=[<that direction's route_id>])"
+            f"\n- All directions: get_line_stops(route_ids={all_route_ids})"
+            f"\nDo NOT call get_line_variants or get_line_directions again."
+        )
+    elif pending:
         options = selection_state.get("agencies", []) if pending == "agency" else [
             g["route_long_names"][0] if g.get("route_long_names") else ""
             for g in selection_state.get("grouped_lines", [])
@@ -139,6 +156,91 @@ def _append_tool_result(messages, tool_call_id, func_name, result, anthropic_raw
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": result})
 
 
+def extract_map_data(result: str) -> dict | None:
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict) and data.get("map_type") == "route_stops":
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def extract_chart_data(result: str) -> dict | None:
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict) and data.get("chart_type") == "departure_schedule":
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def extract_timetable_data(result: str) -> dict | None:
+    try:
+        data = json.loads(result)
+        if isinstance(data, dict) and data.get("timetable_type") == "departure_timetable":
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _summarize_tool_result(func_name: str, content: str) -> str:
+    """Condense a tool result to a one-line summary for message history trimming."""
+    if len(content) <= 300:
+        return content
+    try:
+        data = json.loads(content)
+        if func_name == "get_line_stops":
+            dirs = data if isinstance(data, list) else [data]
+            parts = [f"{d.get('headsign', '?')} ({d.get('stops_count', '?')} stops)" for d in dirs]
+            return f"[get_line_stops: {len(dirs)} direction(s) — {'; '.join(parts)}]"
+        elif func_name == "get_line_variants":
+            return (f"[get_line_variants: line={data.get('line_number')}, "
+                    f"agency={data.get('agency_name')}, "
+                    f"can_proceed={data.get('can_proceed')}, "
+                    f"clarification_needed={data.get('clarification_needed')!r}]")
+        elif func_name == "select_option":
+            return f"[select_option: can_proceed={data.get('can_proceed')}, agency={data.get('agency_name')}]"
+        elif func_name == "run_sql":
+            rows = data if isinstance(data, list) else []
+            return f"[run_sql: {len(rows)} row(s) returned]"
+        elif func_name == "get_departure_timetable":
+            dirs = data.get("directions", {}) if isinstance(data, dict) else {}
+            total = sum(len(v.get("departures", [])) for v in dirs.values())
+            return f"[get_departure_timetable: {len(dirs)} direction(s), {total} departures on {data.get('day', '?')}]"
+        elif func_name == "get_departure_schedule":
+            routes = list(data.keys()) if isinstance(data, dict) else []
+            day_types = list(list(data.values())[0].keys()) if routes else []
+            return f"[get_departure_schedule: {len(routes)} route(s), day types: {', '.join(str(d) for d in day_types)}]"
+        elif func_name == "plot_departure_schedule":
+            return "[plot_departure_schedule: chart generated and sent to UI]"
+        else:
+            return f"[{func_name}: result summarized ({len(content)} chars)]"
+    except (json.JSONDecodeError, TypeError):
+        return f"[{func_name}: {content[:150]}...]"
+
+
+def _trim_tool_results(messages: list, tool_call_names: dict) -> None:
+    """Replace tool result content in-place with short summaries."""
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "tool":
+            func_name = tool_call_names.get(m.get("tool_call_id", ""), "unknown")
+            content = m.get("content", "")
+            if isinstance(content, str):
+                m["content"] = _summarize_tool_result(func_name, content)
+        elif m.get("role") == "user" and isinstance(m.get("content"), list):
+            for block in m["content"]:
+                if block.get("type") == "tool_result":
+                    func_name = tool_call_names.get(block.get("tool_use_id", ""), "unknown")
+                    content = block.get("content", "")
+                    if isinstance(content, str):
+                        block["content"] = _summarize_tool_result(func_name, content)
+
+
 def react_agent(question: str, context: list = None, max_steps: int = 15, stop_event=None):
     """
     question: the current user message (string)
@@ -146,17 +248,25 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
               pass None or [] for a fresh conversation
     """
     history = list(context or []) + [{"role": "user", "content": question}]
-    print(f"[Agent] New query → provider={PROVIDER!r} model={MODEL!r}")
+    print(f"[Agent] New query -> provider={PROVIDER!r} model={MODEL!r}")
     messages = get_messages(history)
     log, coords = [], []
+    map_data = None
+    chart_data = None
+    timetable_data = None
     tool_calls_made = 0
-    MAX_OBS_CHARS = 3000
+    MAX_OBS_CHARS = 2000
     current_response = None
+    tool_call_names = {}  # call_id → func_name, used for trimming
     for step in range(max_steps):
+
+        # --- Trim previous tool results to summaries before next LLM call ---
+        if step > 0:
+            _trim_tool_results(messages, tool_call_names)
 
         # --- Check stop request ---
         if stop_event and stop_event.is_set():
-            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": "Stopped by user."}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": "Stopped by user."}
             return
 
         # --- Call the LLM ---
@@ -165,11 +275,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
         except Exception as e:
             es = str(e)
             status = getattr(e, "status_code", None)
-            print(f"[Agent] LLM error — type={type(e).__name__!r} status={status!r} msg={es[:300]!r}")
+            print(f"[Agent] LLM error - type={type(e).__name__!r} status={status!r} msg={es[:300]!r}")
 
             if "tool_use_failed" in es or (status == 400 and "tool" in es.lower()):
                 log.append({"type": "retry", "text": "tool_use_failed - retrying"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                 messages.append({"role": "user", "content":
                     "Your previous tool call was malformed. Use the structured "
                     "function-calling format. Try again."})
@@ -178,7 +288,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             if status in (413, 429) or "rate_limit" in es or "too large" in es.lower() or "overloaded" in es.lower():
                 wait_s = 60 if PROVIDER == "google" else 20
                 log.append({"type": "retry", "text": f"rate limit - waiting {wait_s}s"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                 for _ in range(wait_s * 2):  # 0.5s steps, interruptible
                     if stop_event and stop_event.is_set():
                         break
@@ -193,7 +303,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
         if not tool_calls:
             if '"type": "function"' in content or ('"name":' in content and '"arguments":' in content):
                 log.append({"type": "retry", "text": "model emitted tool call as text - retrying"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                 messages.append({"role": "user", "content":
                     "You wrote a tool call as plain text. Use the real function-calling "
                     "mechanism, or give your final answer in plain language."})
@@ -209,7 +319,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 is_transport = any(kw in first_user_msg.lower() for kw in transport_keywords)
                 if is_transport:
                     log.append({"type": "retry", "text": "model answered without calling any tool - retrying"})
-                    yield {"status": "retry", "log": list(log), "coords": list(coords), "answer": None}
+                    yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                     messages.append({"role": "user", "content":
                         "You have NOT called any tool yet. "
                         "For questions about a specific line number, call get_line_variants() first. "
@@ -217,7 +327,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     continue
 
             coords += extract_coords(content)
-            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": content}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": content}
             return
 
         # --- Tool calls: execute and feed results back ---
@@ -231,13 +341,14 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
         for tool_call in tool_calls:
             func_name = tool_call.function.name
+            tool_call_names[tool_call.id] = func_name
             args = json.loads(tool_call.function.arguments) or {}
 
             if func_name == "get_line_variants":
                 args = {k: v for k, v in args.items() if k in {"line_number", "agency_name"}}
 
             yield {"status": "calling", "tool": func_name, "args": args,
-                   "log": list(log), "coords": list(coords), "answer": None}
+                   "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
 
             if func_name not in tools_map:
                 result = f"Error: tool '{func_name}' does not exist."
@@ -254,9 +365,24 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             except (json.JSONDecodeError, AttributeError):
                 pass
 
+            if func_name == "show_map":
+                md = extract_map_data(result)
+                if md:
+                    map_data = md
+
+            if func_name == "plot_departure_schedule":
+                cd = extract_chart_data(result)
+                if cd:
+                    chart_data = cd
+
+            if func_name == "get_departure_timetable":
+                td = extract_timetable_data(result)
+                if td:
+                    timetable_data = td
+
             log.append({"type": "action", "tool": func_name, "args": args, "observation": result[:500]})
             coords += extract_coords(result)
-            yield {"status": "step", "log": list(log), "coords": list(coords), "answer": None}
+            yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
 
             trimmed = result if len(result) <= MAX_OBS_CHARS else result[:MAX_OBS_CHARS] + "\n...[truncated]"
             _append_tool_result(messages, tool_call.id, func_name, trimmed, current_response)
@@ -276,10 +402,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 "content": (
                     f"Line {line_num} of {agency} is now uniquely identified. "
                     f"route_ids = {route_ids}. "
-                    f"These route_ids are the same line in different directions — always include all of them. "
-                    f"Now call run_sql() to answer the user's question. "
-                    f"Filter by: WHERE route_id IN ({ids_str}). "
-                    f"For stop questions: join stop_times → stops, use (SELECT trip_id FROM trips WHERE route_id = X LIMIT 1) per route_id, ORDER BY stop_sequence."
+                    f"These route_ids are the same line in different directions — always include all of them.\n"
+                    f"Based on the user's original question, decide what to do next:\n"
+                    f"• Stop or map questions → call get_line_directions(route_ids={route_ids})\n"
+                    f"• Schedule / departure / timetable questions → DO NOT call any tool yet. First ask the user to choose: (1) Timetable — exact times for a specific day, or (2) Frequency chart — average departures per hour by day type. Wait for their answer before proceeding.\n"
+                    f"• Other questions → use run_sql() with WHERE route_id IN ({ids_str})"
                 ),
             })
             can_proceed = False
@@ -290,15 +417,29 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             try:
                 options = last_parsed.get("options", [])
                 n = len(options)
+                clarification_type = last_parsed.get("clarification_needed", "")
                 formatted_list = "\n".join(f"{opt['option_number']}. {opt['label']}" for opt in options)
+
+                if clarification_type == "direction":
+                    after_list = (
+                        f"Ask the user to enter a number from 1 to {n-1} for a specific direction, "
+                        f"or {n} for all directions."
+                    )
+                elif clarification_type == "agency":
+                    after_list = (
+                        f"If the question is purely about who operates the line, this list IS the answer. "
+                        f"Otherwise ask the user to enter a number from 1 to {n}."
+                    )
+                else:
+                    after_list = f"Ask the user to enter a number from 1 to {n}."
+
                 messages.append({
                     "role": "user",
                     "content": (
                         f"Include this numbered list verbatim in your response:\n\n"
                         f"{formatted_list}\n\n"
                         f"Do not reformat, renumber, or remove any item. "
-                        f"If the question is about who operates the line, this list IS the answer. "
-                        f"Otherwise, after the list ask the user to enter a number from 1 to {n}."
+                        f"{after_list}"
                     ),
                 })
             except Exception:
@@ -306,7 +447,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
             llm_resp = _call_llm(messages, tool_choice="none")
             content, _ = _parse_response(llm_resp)
-            yield {"status": "done", "log": list(log), "coords": list(coords), "answer": content}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": content}
             return
 
-    yield {"status": "done", "log": list(log), "coords": list(coords), "answer": "Max steps reached"}
+    yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "answer": "Max steps reached"}

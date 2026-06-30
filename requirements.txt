@@ -5,3 +5,5 @@ requests
 streamlit
 python-dotenv
 duckdb
+pandas
+plotly
