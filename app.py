@@ -66,6 +66,23 @@ h1 { font-weight: 800 !important; letter-spacing: -0.02em; }
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: #6b7280;
+    margin-top: 0.3rem;
+    margin-bottom: 0.4rem;
+}
+
+/* Compact sidebar spacing (enough to avoid scrolling, not cramped) */
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: 0.6rem;
+}
+[data-testid="stSidebar"] hr {
+    margin: 8px 0;
+}
+[data-testid="stSidebar"] .stButton button {
+    padding: 0.4rem 0.85rem;
+    font-size: 13.5px;
+}
+[data-testid="stSidebar"] .stMarkdown p {
+    margin-bottom: 0.4rem;
 }
 
 [data-testid="stChatMessage"] pre {
@@ -197,7 +214,7 @@ def _step_label(tool: str, args: dict, obs: str) -> str:
             return f"🚏 Loaded {total} stops across {len(data)} direction(s)"
         return "🚏 Loading stop list..."
 
-    if tool == "show_map":
+    if tool == "plot_route_map":
         return "🗺️ Building the route map..."
 
     if tool == "get_departure_timetable":
@@ -242,138 +259,40 @@ def render_timetable(timetable_data: dict):
 
 
 def render_route_map(map_data: dict):
-    routes = map_data.get("routes", [])
-    if not routes:
+    figure_json = map_data.get("figure_json")
+    if not figure_json:
         return
-
-    title = routes[0]["route_long_name"] if len(routes) == 1 else "מסלול הקו"
-    st.markdown(f"<div style='font-weight:600;font-size:14px;margin-bottom:6px'>{title}</div>",
-                unsafe_allow_html=True)
-
-    scatter_data, text_data = [], []
-    for route in routes:
-        color = route.get("color", [220, 38, 38])
-        for stop in route["stops"]:
-            scatter_data.append({
-                "lat": stop["lat"], "lon": stop["lon"],
-                "color": color,
-                "stop_name": stop["stop_name"],
-                "stop_code": stop.get("stop_code", ""),
-                "sequence": stop["sequence"],
-            })
-            text_data.append({
-                "lat": stop["lat"], "lon": stop["lon"],
-                "label": str(stop["sequence"]),
-            })
-
-    if not scatter_data:
-        return
-
-    mid_lat = sum(s["lat"] for s in scatter_data) / len(scatter_data)
-    mid_lon = sum(s["lon"] for s in scatter_data) / len(scatter_data)
-
-    scatter = pdk.Layer(
-        "ScatterplotLayer",
-        data=scatter_data,
-        get_position="[lon, lat]",
-        get_fill_color="color",
-        get_line_color=[255, 255, 255],
-        get_radius=60,
-        radius_min_pixels=6,
-        radius_max_pixels=14,
-        stroked=True,
-        filled=True,
-        line_width_min_pixels=2,
-        pickable=True,
-    )
-
-    text = pdk.Layer(
-        "TextLayer",
-        data=text_data,
-        get_position="[lon, lat]",
-        get_text="label",
-        get_size=11,
-        get_color=[40, 40, 40],
-        get_background_color=[255, 255, 255, 200],
-        background=True,
-        background_padding=[2, 1, 2, 1],
-        get_pixel_offset=[12, -12],
-        pickable=False,
-    )
-
-    st.pydeck_chart(pdk.Deck(
-        layers=[scatter, text],
-        initial_view_state=pdk.ViewState(latitude=mid_lat, longitude=mid_lon, zoom=13),
-        map_style="light",
-        tooltip={"text": "{stop_name}\nקוד: {stop_code}\nעצירה מס׳: {sequence}"},
-    ), height=400, use_container_width=True)
-
-    if len(routes) > 1:
-        parts = []
-        for route in routes:
-            c = route.get("color", [220, 38, 38])
-            hex_c = "#{:02x}{:02x}{:02x}".format(*c)
-            parts.append(f'<span style="color:{hex_c};font-size:15px">●</span> {route["route_long_name"]}')
-        st.markdown(" &nbsp;&nbsp; ".join(parts), unsafe_allow_html=True)
+    try:
+        fig = pio.from_json(figure_json)
+        # scrollZoom: mouse wheel zooms the map instead of scrolling the page
+        st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+    except Exception as e:
+        st.error(f"Map render error: {e}")
 
 
-def _agent_thread(question, context, result_queue, stop_event, provider):
-    import os, sys, importlib
-    os.environ["PROVIDER"] = provider
-    for mod_name in ["config", "agent.utils", "agent.core"]:
-        if mod_name in sys.modules:
-            importlib.reload(sys.modules[mod_name])
+def _agent_thread(question, context, result_queue, stop_event):
     from agent.core import react_agent
+    log = []
     try:
         for update in react_agent(question, context=context, stop_event=stop_event):
+            log = update.get("log", log)
             result_queue.put(update)
     except Exception as e:
+        print(f"[Agent] Unhandled error: {type(e).__name__}: {e}")
         result_queue.put({
-            "status": "done", "log": [], "coords": [],
-            "answer": f"Error: {e}",
+            "status": "done", "log": log, "coords": [],
+            "answer": "Something went wrong while generating a response — please try asking again.",
         })
     result_queue.put(None)
 
 
-PROVIDERS = {
-    "groq":   "Groq (llama-3.3-70b-versatile)",
-    "google": "Google (gemini-2.5-flash)",
-}
-
 # --- Sidebar ---
 with st.sidebar:
-    default_provider = "google"
-    provider_keys = list(PROVIDERS.keys())
-    selected_provider = st.selectbox(
-        "LLM Provider",
-        provider_keys,
-        index=provider_keys.index(st.session_state.get("provider", default_provider)),
-        format_func=lambda k: PROVIDERS[k],
-        disabled=st.session_state.agent_running,
-    )
-    st.caption("Free tier models — may experience rate limits or token shortages.")
-    if selected_provider != st.session_state.get("provider", default_provider):
-        st.session_state["provider"] = selected_provider
-        st.rerun()
-
-    st.divider()
-
+    st.caption("Free tier models — the agent automatically switches models if one runs low on quota.")
     st.markdown("### What I can help with")
-    st.markdown("""
-**Line information**
-- Stops & stop order
-- Departure schedule & timetable
-- Operators & agencies
-
-**Coming soon**
-- Mapping & geospatial queries
-- Comparison between lines
-""")
-
-    st.divider()
+    st.caption("Stops & stop order · Departure schedule & timetable · Operators & agencies")
 
     st.markdown("### Questions for example")
-
     EXAMPLES = [
         "What is the first stop of line 189 of Dan?",
         "How many operators run line 5?",
@@ -406,47 +325,49 @@ with col_sep:
 
 # ── Right column: visualization panel ──
 with col_viz:
-    st.markdown("#### 🗺️ Map")
+    viz_window = st.container(height=700, border=False)
+    with viz_window:
+        st.markdown("#### 🗺️ Map")
 
-    display_map = st.session_state.agent_map_data
-    if not display_map:
-        for msg in reversed(st.session_state.chat_history):
-            if msg.get("map_data"):
-                display_map = msg["map_data"]
-                break
+        display_map = st.session_state.agent_map_data
+        if not display_map:
+            for msg in reversed(st.session_state.chat_history):
+                if msg.get("map_data"):
+                    display_map = msg["map_data"]
+                    break
 
-    if display_map:
-        render_route_map(display_map)
-    else:
-        render_israel_overview_map()
+        if display_map:
+            render_route_map(display_map)
+        else:
+            render_israel_overview_map()
 
-    st.markdown("<div style='margin-top:24px'></div>", unsafe_allow_html=True)
-    st.markdown("#### 📊 Charts")
+        st.markdown("<div style='margin-top:24px'></div>", unsafe_allow_html=True)
+        st.markdown("#### 📊 Charts")
 
-    display_chart = st.session_state.agent_chart_data
-    if not display_chart:
-        for msg in reversed(st.session_state.chat_history):
-            if msg.get("chart_data"):
-                display_chart = msg["chart_data"]
-                break
+        display_chart = st.session_state.agent_chart_data
+        if not display_chart:
+            for msg in reversed(st.session_state.chat_history):
+                if msg.get("chart_data"):
+                    display_chart = msg["chart_data"]
+                    break
 
-    if display_chart:
-        try:
-            fig = pio.from_json(display_chart["figure_json"])
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception as e:
-            st.error(f"Chart render error: {e}")
-    else:
-        try:
-            default_fig = pio.from_json(_agency_lines_chart_json())
-            st.plotly_chart(default_fig, use_container_width=True)
-        except Exception:
-            st.markdown(
-                "<div class='viz-placeholder' style='height:180px'>"
-                "Chart will appear here based on your question"
-                "</div>",
-                unsafe_allow_html=True,
-            )
+        if display_chart:
+            try:
+                fig = pio.from_json(display_chart["figure_json"])
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"Chart render error: {e}")
+        else:
+            try:
+                default_fig = pio.from_json(_agency_lines_chart_json())
+                st.plotly_chart(default_fig, use_container_width=True)
+            except Exception:
+                st.markdown(
+                    "<div class='viz-placeholder' style='height:180px'>"
+                    "Chart will appear here based on your question"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 # ── Vertical separator between columns ──
@@ -466,8 +387,8 @@ st.markdown("""
 with col_chat:
     st.title("ISRAEL TRANSIT AGENT 🚍")
 
-    # Fixed-height scrollable message window
-    chat_window = st.container(height=580, border=False)
+    # Fixed-height scrollable message window (matches the viz panel's height)
+    chat_window = st.container(height=600, border=False)
 
     with chat_window:
         if not st.session_state.get("chat_history"):
@@ -525,13 +446,20 @@ with col_chat:
 
                 with st.expander("🤔 Agent steps", expanded=True):
                     for step in st.session_state.agent_log:
-                        if step["type"] == "retry":
+                        if step["type"] == "switch":
+                            limit_type = step.get("limit_type", "rate").capitalize()
+                            from_model = step.get("from_model", "")
+                            to_model = step.get("to_model", "")
+                            st.caption(f"🔄 {limit_type} limit reached on {from_model} — switching to {to_model}...")
+                        elif step["type"] == "retry":
                             text = step.get("text", "")
                             if "rate limit" in text or "waiting" in text:
-                                import re as _re
-                                secs = _re.search(r"(\d+)s", text)
-                                wait = f" ({secs.group(1)}s)" if secs else ""
-                                label = f"⏳ Rate limit hit, waiting{wait}..."
+                                wait_s = step.get("wait_s")
+                                wait = f" ({wait_s}s)" if wait_s else ""
+                                limit_type = step.get("limit_type", "rate").capitalize()
+                                model_name = step.get("model", "")
+                                model_part = f" for {model_name}" if model_name else ""
+                                label = f"⏳ {limit_type} limit reached{model_part}, waiting{wait}..."
                             elif "tool call as text" in text:
                                 label = "⟳ Model response malformed, retrying..."
                             elif "without calling any tool" in text:
@@ -541,6 +469,8 @@ with col_chat:
                             else:
                                 label = f"⟳ Retrying..."
                             st.caption(label)
+                        elif step["type"] == "verify":
+                            st.caption("🔎 Double-checking the answer...")
                         else:
                             label = _step_label(
                                 step["tool"], step["args"], step.get("observation", "")
@@ -579,11 +509,10 @@ with col_chat:
             st.session_state.agent_queue = queue.Queue()
             st.session_state.agent_running = True
 
-            active_provider = st.session_state.get("provider", os.environ.get("PROVIDER", "google"))
             t = threading.Thread(
                 target=_agent_thread,
                 args=(question, context, st.session_state.agent_queue,
-                      st.session_state.stop_event, active_provider),
+                      st.session_state.stop_event),
                 daemon=True,
             )
             t.start()

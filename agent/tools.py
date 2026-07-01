@@ -1,26 +1,24 @@
 import json
-import os
 import re
-import tempfile
 import duckdb
-import pandas as pd
 import plotly.graph_objects as go
 from collections import defaultdict
-from pathlib import Path
 
 _conn: duckdb.DuckDBPyConnection = None
 MAX_ROWS = 30
-_GTFS_DIR = os.path.join(tempfile.gettempdir(), "gtfs_israel")
 
 # Persists across turns so select_option can map numbers to Hebrew values
 selection_state = {
-    "pending_type": None,   # "agency", "route", "direction", or None
+    "pending_type": None,   # "agency", "route", "direction", "schedule_choice", or None
     "line_number": None,
     "agencies": [],
     "grouped_lines": [],
     "options": [],
     "directions": [],       # for direction selection
     "all_route_ids": [],    # for direction selection
+    "schedule_route_ids": [],   # for schedule_choice: route_ids of the already-identified line
+    "schedule_agency": None,    # for schedule_choice
+    "schedule_line_number": None,  # for schedule_choice
 }
 
 
@@ -44,15 +42,33 @@ def get_schema() -> str:
         return f"Error: {e}"
 
 
-def get_line_variants(line_number: str, agency_name: str = None) -> str:
+def get_line_variants(line_number: str, agency_name: str = None, _internal: bool = False) -> str:
     """
     Return route variants for a given line number.
     Stage 1 (no agency_name): if multiple agencies exist, ask for agency.
     Stage 2 (agency_name given): if multiple real lines in that agency, ask for route.
     Stage 3: uniquely identified — can_proceed = true.
+
+    _internal is only ever set True by select_option's own follow-up call (never
+    reachable from a model tool-call — core.py strips unknown args before dispatch).
+    It lets that legitimate re-entry through while still blocking the model from
+    restarting an already-pending disambiguation instead of calling select_option.
     """
     if _conn is None:
         return "Error: GTFS database not loaded yet."
+
+    pending = selection_state.get("pending_type")
+    if not _internal and pending in ("agency", "route") and str(selection_state.get("line_number")) == str(line_number):
+        return json.dumps({
+            "error": "A selection is already pending for this line number.",
+            "clarification_needed": pending,
+            "options": selection_state.get("options", []),
+            "instruction": (
+                "Do NOT call get_line_variants again for this line. "
+                "Call select_option(option_number) using the number from the user's last message."
+            ),
+        }, ensure_ascii=False)
+
     try:
         params = [str(line_number)]
         where_clause = "WHERE r.route_short_name = ?"
@@ -80,7 +96,7 @@ def get_line_variants(line_number: str, agency_name: str = None) -> str:
                 "clarification_needed": None,
                 "reason": msg + ".",
                 "routes": [],
-            }, ensure_ascii=False, indent=2)
+            }, ensure_ascii=False)
 
         routes = []
         for route_id, row_agency, route_long_name, route_desc in rows:
@@ -112,7 +128,7 @@ def get_line_variants(line_number: str, agency_name: str = None) -> str:
                 "options_count": len(options),
                 "options": options,
                 "instruction": f"Show ONLY the options list above as a numbered list. Valid choices: 1 to {len(options)}. Ask the user to enter a number.",
-            }, ensure_ascii=False, indent=2)
+            }, ensure_ascii=False)
 
         # Stage 2: group real lines within this agency by 5-digit route code
         line_groups = defaultdict(list)
@@ -158,7 +174,7 @@ def get_line_variants(line_number: str, agency_name: str = None) -> str:
                 "options_count": len(options),
                 "options": options,
                 "instruction": f"Show ONLY the options list above as a numbered list. Valid choices: 1 to {len(options)}. Ask the user to enter a number.",
-            }, ensure_ascii=False, indent=2)
+            }, ensure_ascii=False)
 
         # Stage 3: uniquely identified
         selection_state.update({
@@ -177,7 +193,7 @@ def get_line_variants(line_number: str, agency_name: str = None) -> str:
             "routes_count": len(routes),
             "selected_line": selected_group,
             "routes": routes,
-        }, ensure_ascii=False, indent=2)
+        }, ensure_ascii=False)
 
     except Exception as e:
         return f"Error: {e}"
@@ -198,7 +214,7 @@ def select_option(option_number: int) -> str:
             return json.dumps({"error": f"Invalid option {option_number}. Valid range: 1–{len(agencies)}"})
         agency_name = agencies[idx]
         line_number = selection_state["line_number"]
-        return get_line_variants(line_number=line_number, agency_name=agency_name)
+        return get_line_variants(line_number=line_number, agency_name=agency_name, _internal=True)
 
     if pending_type == "route":
         grouped_lines = selection_state.get("grouped_lines", [])
@@ -211,7 +227,7 @@ def select_option(option_number: int) -> str:
             "clarification_needed": None,
             "selected_line": selected_line,
             "reason": "Route option selected. The agent can proceed.",
-        }, ensure_ascii=False, indent=2)
+        }, ensure_ascii=False)
 
     return json.dumps({"error": "No pending selection. Ask the user a question first."})
 
@@ -276,7 +292,7 @@ def get_line_stops(route_ids: list) -> str:
         if not directions:
             return "No stops found for the given route_ids."
 
-        return json.dumps(directions, ensure_ascii=False, indent=2)
+        return json.dumps(directions, ensure_ascii=False)
     except Exception as e:
         return f"Error: {e}"
 
@@ -338,106 +354,153 @@ def get_line_directions(route_ids: list) -> str:
             "options": options,
             "directions": directions,
             "all_route_ids": list(route_ids),
-        }, ensure_ascii=False, indent=2)
-    except Exception as e:
-        return f"Error: {e}"
-
-
-def show_map(route_ids: list) -> str:
-    """Return stop coordinates and route info for rich map rendering."""
-    if _conn is None:
-        return "Error: GTFS database not loaded yet."
-    try:
-        COLORS = [
-            [220, 38, 38],
-            [37, 99, 235],
-            [16, 185, 129],
-            [245, 158, 11],
-            [139, 92, 246],
-        ]
-        routes_data = []
-        seen = set()
-        color_idx = 0
-
-        for route_id in route_ids:
-            rows = _conn.execute("""
-                SELECT r.route_long_name, t.trip_headsign,
-                       s.stop_name, s.stop_code, st.stop_sequence,
-                       s.stop_lat, s.stop_lon
-                FROM stop_times st
-                JOIN stops s ON st.stop_id = s.stop_id
-                JOIN trips t ON st.trip_id = t.trip_id
-                JOIN routes r ON t.route_id = r.route_id
-                WHERE t.route_id = ?
-                  AND st.trip_id = (SELECT trip_id FROM trips WHERE route_id = ? LIMIT 1)
-                ORDER BY st.stop_sequence
-            """, [route_id, route_id]).fetchall()
-
-            if not rows:
-                continue
-
-            key = (rows[0][0], rows[0][1])
-            if key in seen:
-                continue
-            seen.add(key)
-
-            routes_data.append({
-                "route_id": route_id,
-                "route_long_name": rows[0][0],
-                "headsign": rows[0][1],
-                "color": COLORS[color_idx % len(COLORS)],
-                "stops": [
-                    {"sequence": r[4], "stop_name": r[2],
-                     "stop_code": r[3], "lat": float(r[5]), "lon": float(r[6])}
-                    for r in rows
-                ],
-            })
-            color_idx += 1
-
-        if not routes_data:
-            return "No stop data found for the given route_ids."
-
-        return json.dumps({
-            "map_type": "route_stops",
-            "routes_count": len(routes_data),
-            "routes": routes_data,
         }, ensure_ascii=False)
     except Exception as e:
         return f"Error: {e}"
 
 
-def avg_departures_by_hour_by_day_type(gtfs_path, route_ids, specific_day=None):
-    gtfs_path = Path(gtfs_path)
-    trips = pd.read_csv(gtfs_path / "trips.txt", dtype=str)
-    stop_times = pd.read_csv(gtfs_path / "stop_times.txt", dtype=str)
-    calendar = pd.read_csv(gtfs_path / "calendar.txt", dtype=str)
+# Distinct colors per direction, reused across the map's line + stop-marker traces
+_MAP_COLORS = ["#dc2626", "#2563eb", "#10b981", "#f59e0b", "#8b5cf6"]
 
-    route_ids = [str(r) for r in route_ids]
-    trips = trips[trips["route_id"].isin(route_ids)]
 
-    first_stops = (
-        stop_times[stop_times["trip_id"].isin(trips["trip_id"])]
-        .sort_values(["trip_id", "stop_sequence"])
-        .groupby("trip_id", as_index=False)
-        .first()
-    )
+def plot_route_map(route_ids: list, line_num: str = None, agency: str = None) -> str:
+    """
+    Interactive map: numbered stop markers per direction, each direction its
+    own color, with a dropdown to isolate a single direction (mirrors
+    plot_departure_schedule's route/day dropdowns). Reuses get_line_stops for
+    the underlying stop data - there's no separate "geometry" query needed
+    since shapes.txt isn't loaded (see gtfs_db.py). Points only, no connecting
+    line between stops.
 
-    df = trips[["route_id", "trip_id", "service_id"]].merge(
-        first_stops[["trip_id", "departure_time"]],
-        on="trip_id",
-        how="inner"
-    )
-    df["hour"] = df["departure_time"].str.split(":").str[0].astype(int) % 24
+    line_num/agency are passed in from the caller (already known when a line
+    is resolved) purely for the title - avoids a redundant DB lookup.
 
-    day_cols = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-    df = df.merge(calendar[["service_id"] + day_cols], on="service_id", how="left")
+    This is not exposed to the LLM as a callable tool - agent/core.py calls
+    it directly the moment a line is resolved, so a map always accompanies
+    any answer about a specific line without depending on the model to
+    remember to ask for one.
+    """
+    try:
+        raw = get_line_stops(route_ids)
+        directions = json.loads(raw)
+        if not isinstance(directions, list) or not directions:
+            return json.dumps({"error": "No stop data found for the given route_ids."}, ensure_ascii=False)
 
-    valid_days = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+        fig = go.Figure()
+        trace_for_direction = {}  # direction index -> trace index
+        all_lats, all_lons = [], []
+
+        def label_for(direction):
+            headsign = direction.get("headsign") or str(direction.get("route_id", ""))
+            return headsign[:20] + ("…" if len(headsign) > 20 else "")
+
+        for i, direction in enumerate(directions):
+            color = _MAP_COLORS[i % len(_MAP_COLORS)]
+            stops = direction["stops"]
+            lats = [s["lat"] for s in stops]
+            lons = [s["lon"] for s in stops]
+            all_lats += lats
+            all_lons += lons
+
+            fig.add_trace(go.Scattermapbox(
+                lat=lats, lon=lons, mode="markers+text",
+                marker=dict(size=20, color=color),
+                text=[str(s["sequence"]) for s in stops],
+                textfont=dict(size=10, color="white"),
+                hovertext=[f"{s['stop_name']} — {s['stop_code']}" for s in stops],
+                hoverinfo="text",
+                name=label_for(direction), showlegend=True,
+            ))
+            trace_for_direction[i] = len(fig.data) - 1
+
+        total_traces = len(fig.data)
+
+        def visible_for(selected):
+            visible = [False] * total_traces
+            for idx in selected:
+                visible[trace_for_direction[idx]] = True
+            return visible
+
+        buttons = [dict(
+            label="All directions", method="update",
+            args=[{"visible": visible_for(list(trace_for_direction.keys()))}],
+        )]
+        for i, direction in enumerate(directions):
+            buttons.append(dict(
+                label=label_for(direction), method="update",
+                args=[{"visible": visible_for([i])}],
+            ))
+
+        mid_lat = sum(all_lats) / len(all_lats)
+        mid_lon = sum(all_lons) / len(all_lons)
+
+        title_text = "Route map"
+        if line_num or agency:
+            title_text += f" — Line {line_num or ''} | {agency or ''}"
+
+        fig.update_layout(
+            title=dict(text=title_text, y=0.99, yanchor="top"),
+            mapbox=dict(style="open-street-map", center=dict(lat=mid_lat, lon=mid_lon), zoom=12),
+            margin=dict(l=0, r=0, t=80, b=0),
+            height=420,
+            updatemenus=[dict(
+                buttons=buttons, direction="down", x=0, y=0.99,
+                xanchor="left", yanchor="top", showactive=True,
+                pad=dict(t=25),
+            )],
+            legend=dict(title="Direction", x=0, y=0),
+        )
+
+        return json.dumps({"chart_type": "route_map", "figure_json": fig.to_json()}, ensure_ascii=False)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+_VALID_DAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+_DAY_COLS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def avg_departures_by_hour_by_day_type(route_ids, specific_day=None):
+    """
+    Queries the DuckDB tables already held in memory (loaded once at startup)
+    instead of re-parsing stop_times.txt (~7.4M rows, ~400MB) from disk on
+    every call - that re-parse was the main cause of slow responses.
+    """
+    route_ids = [int(r) for r in route_ids]
+    placeholders = ",".join("?" * len(route_ids))
+
+    rows = _conn.execute(f"""
+        WITH filtered_trips AS (
+            SELECT trip_id, route_id, service_id
+            FROM trips
+            WHERE route_id IN ({placeholders})
+        ),
+        first_stop AS (
+            SELECT trip_id, departure_time,
+                   ROW_NUMBER() OVER (PARTITION BY trip_id ORDER BY stop_sequence) AS rn
+            FROM stop_times
+            WHERE trip_id IN (SELECT trip_id FROM filtered_trips)
+        )
+        SELECT ft.route_id, ft.service_id, fs.departure_time
+        FROM filtered_trips ft
+        JOIN first_stop fs ON fs.trip_id = ft.trip_id AND fs.rn = 1
+    """, route_ids).fetchall()
+
+    if not rows:
+        return {}
+
+    service_ids = sorted(set(r[1] for r in rows))
+    cal_placeholders = ",".join("?" * len(service_ids))
+    cal_rows = _conn.execute(
+        f"SELECT service_id, {', '.join(_DAY_COLS)} FROM calendar WHERE service_id IN ({cal_placeholders})",
+        service_ids,
+    ).fetchall()
+    cal_map = {r[0]: dict(zip(_DAY_COLS, r[1:])) for r in cal_rows}
 
     if specific_day is not None:
         specific_day = specific_day.lower()
-        if specific_day not in valid_days:
-            raise ValueError(f"specific_day must be one of: {valid_days}")
+        if specific_day not in _VALID_DAYS:
+            raise ValueError(f"specific_day must be one of: {_VALID_DAYS}")
         day_groups = {specific_day: [specific_day]}
     else:
         day_groups = {
@@ -446,30 +509,39 @@ def avg_departures_by_hour_by_day_type(gtfs_path, route_ids, specific_day=None):
             "saturday": ["saturday"],
         }
 
+    buckets = defaultdict(list)  # (route_id, hour) -> [service_id, ...]
+    for route_id, service_id, departure_time in rows:
+        hour = int(departure_time.split(":")[0]) % 24
+        buckets[(route_id, hour)].append(service_id)
+
     result = {}
-    for route_id, route_df in df.groupby("route_id"):
-        result[route_id] = {group_name: {} for group_name in day_groups.keys()}
-        for hour, hour_df in route_df.groupby("hour"):
+    for route_id in sorted(set(r[0] for r in rows)):
+        result[route_id] = {group_name: {} for group_name in day_groups}
+        hours = sorted(h for (rid, h) in buckets if rid == route_id)
+        for hour in hours:
+            sids = buckets[(route_id, hour)]
             for group_name, days in day_groups.items():
-                daily_counts = []
-                for day in days:
-                    active_trips = hour_df[hour_df[day] == "1"]
-                    daily_counts.append(len(active_trips))
-                result[route_id][group_name][hour] = round(
-                    sum(daily_counts) / len(daily_counts), 1
-                )
+                daily_counts = [
+                    sum(1 for sid in sids if cal_map.get(sid, {}).get(day) == 1)
+                    for day in days
+                ]
+                result[route_id][group_name][hour] = round(sum(daily_counts) / len(daily_counts), 1)
     return result
 
 
-def _build_departure_chart(route_departures_dict, gtfs_path, specific_day=None):
-    gtfs_path = Path(gtfs_path)
-    routes = pd.read_csv(gtfs_path / "routes.txt", dtype=str)
-    agency = pd.read_csv(gtfs_path / "agency.txt", dtype=str)
-
-    if "agency_id" in routes.columns and "agency_id" in agency.columns:
-        routes = routes.merge(agency[["agency_id", "agency_name"]], on="agency_id", how="left")
-    else:
-        routes["agency_name"] = agency["agency_name"].iloc[0]
+def _build_departure_chart(route_departures_dict, specific_day=None):
+    route_ids = list(route_departures_dict.keys())
+    placeholders = ",".join("?" * len(route_ids))
+    meta_rows = _conn.execute(f"""
+        SELECT r.route_id, r.route_short_name, r.route_long_name, a.agency_name
+        FROM routes r
+        LEFT JOIN agency a ON r.agency_id = a.agency_id
+        WHERE r.route_id IN ({placeholders})
+    """, route_ids).fetchall()
+    route_info_by_id = {
+        r[0]: {"route_short_name": r[1] or "", "route_long_name": r[2] or str(r[0]), "agency_name": r[3] or ""}
+        for r in meta_rows
+    }
 
     if specific_day is not None:
         specific_day = specific_day.lower()
@@ -479,14 +551,13 @@ def _build_departure_chart(route_departures_dict, gtfs_path, specific_day=None):
         day_types = ["working_days", "friday", "saturday"]
         day_labels = {"working_days": "Working days", "friday": "Friday", "saturday": "Saturday"}
 
-    route_ids = list(route_departures_dict.keys())
     fig = go.Figure()
     route_meta = {}
     trace_map = {}
     trace_index = 0
 
     for route_id in route_ids:
-        route_info = routes[routes["route_id"] == str(route_id)].iloc[0]
+        route_info = route_info_by_id.get(route_id, {})
         route_meta[route_id] = {
             "route_short_name": route_info.get("route_short_name", ""),
             "route_long_name": route_info.get("route_long_name", route_id),
@@ -589,59 +660,49 @@ def _build_departure_chart(route_departures_dict, gtfs_path, specific_day=None):
     return fig.to_json()
 
 
-def _get_departure_timetable_raw(gtfs_path, route_ids, specific_day):
-    gtfs_path = Path(gtfs_path)
+def _get_departure_timetable_raw(route_ids, specific_day):
     specific_day = specific_day.lower()
-    route_ids = [str(r) for r in route_ids]
+    if specific_day not in _VALID_DAYS:
+        raise ValueError(f"specific_day must be one of: {_VALID_DAYS}")
+    route_ids = [int(r) for r in route_ids]
+    placeholders = ",".join("?" * len(route_ids))
 
-    routes = pd.read_csv(gtfs_path / "routes.txt", dtype=str)
-    trips = pd.read_csv(gtfs_path / "trips.txt", dtype=str)
-    stop_times = pd.read_csv(gtfs_path / "stop_times.txt", dtype=str)
-    calendar = pd.read_csv(gtfs_path / "calendar.txt", dtype=str)
-
-    trips = trips[trips["route_id"].isin(route_ids)]
-    trips = trips.merge(
-        routes[["route_id", "route_short_name", "route_long_name"]],
-        on="route_id", how="left"
-    )
-
-    active_services = calendar.loc[calendar[specific_day] == "1", "service_id"]
-    trips = trips[trips["service_id"].isin(active_services)]
-
-    stop_times["stop_sequence"] = stop_times["stop_sequence"].astype(int)
-    first_departures = (
-        stop_times[stop_times["trip_id"].isin(trips["trip_id"])]
-        .sort_values(["trip_id", "stop_sequence"])
-        .groupby("trip_id", as_index=False)
-        .first()[["trip_id", "departure_time"]]
-    )
-
-    df = trips[["route_id", "route_short_name", "route_long_name", "trip_id"]].merge(
-        first_departures, on="trip_id", how="inner"
-    )
-    df["sort_time"] = df["departure_time"].apply(
-        lambda t: int(t.split(":")[0]) * 3600 + int(t.split(":")[1]) * 60 + int(t.split(":")[2])
-    )
-    df = df.sort_values(["route_id", "sort_time"])
-    df["departure_time"] = df["departure_time"].str[:5]
+    rows = _conn.execute(f"""
+        WITH filtered_trips AS (
+            SELECT t.trip_id, t.route_id, t.service_id, r.route_long_name
+            FROM trips t
+            JOIN routes r ON r.route_id = t.route_id
+            WHERE t.route_id IN ({placeholders})
+        ),
+        active_trips AS (
+            SELECT ft.trip_id, ft.route_id, ft.route_long_name
+            FROM filtered_trips ft
+            JOIN calendar c ON c.service_id = ft.service_id
+            WHERE c.{specific_day} = 1
+        ),
+        first_stop AS (
+            SELECT trip_id, departure_time,
+                   ROW_NUMBER() OVER (PARTITION BY trip_id ORDER BY stop_sequence) AS rn
+            FROM stop_times
+            WHERE trip_id IN (SELECT trip_id FROM active_trips)
+        )
+        SELECT act.route_id, act.route_long_name, fs.departure_time
+        FROM active_trips act
+        JOIN first_stop fs ON fs.trip_id = act.trip_id AND fs.rn = 1
+        ORDER BY act.route_id, fs.departure_time
+    """, route_ids).fetchall()
 
     result = {}
-    for route_id, group in df.groupby("route_id"):
-        result[route_id] = group[["route_short_name", "route_long_name", "departure_time"]].reset_index(drop=True)
+    for route_id, route_long_name, departure_time in rows:
+        entry = result.setdefault(route_id, {"headsign": route_long_name or str(route_id), "departures": []})
+        entry["departures"].append(departure_time[:5])
     return result
 
 
 def get_departure_timetable(route_ids: list, specific_day: str) -> str:
     """Get all departure times for a line on a specific day, grouped by direction."""
     try:
-        raw = _get_departure_timetable_raw(_GTFS_DIR, route_ids, specific_day)
-        directions = {}
-        for route_id, df in raw.items():
-            headsign = df["route_long_name"].iloc[0] if len(df) > 0 else str(route_id)
-            directions[route_id] = {
-                "headsign": headsign,
-                "departures": df["departure_time"].tolist(),
-            }
+        directions = _get_departure_timetable_raw(route_ids, specific_day)
         return json.dumps({
             "timetable_type": "departure_timetable",
             "day": specific_day,
@@ -654,7 +715,7 @@ def get_departure_timetable(route_ids: list, specific_day: str) -> str:
 def get_departure_schedule(route_ids: list, specific_day: str = None) -> str:
     """Get average departures per hour by day type for a line."""
     try:
-        result = avg_departures_by_hour_by_day_type(_GTFS_DIR, route_ids, specific_day)
+        result = avg_departures_by_hour_by_day_type(route_ids, specific_day)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return f"Error: {e}"
@@ -663,8 +724,8 @@ def get_departure_schedule(route_ids: list, specific_day: str = None) -> str:
 def plot_departure_schedule(route_ids: list, specific_day: str = None) -> str:
     """Generate an interactive departure schedule chart and return it for rendering."""
     try:
-        data = avg_departures_by_hour_by_day_type(_GTFS_DIR, route_ids, specific_day)
-        fig_json = _build_departure_chart(data, _GTFS_DIR, specific_day)
+        data = avg_departures_by_hour_by_day_type(route_ids, specific_day)
+        fig_json = _build_departure_chart(data, specific_day)
         return json.dumps(
             {"chart_type": "departure_schedule", "figure_json": fig_json},
             ensure_ascii=False,
@@ -701,7 +762,6 @@ tools_map = {
     "select_option": select_option,
     "get_line_directions": get_line_directions,
     "get_line_stops": get_line_stops,
-    "show_map": show_map,
     "get_departure_timetable": get_departure_timetable,
     "get_departure_schedule": get_departure_schedule,
     "plot_departure_schedule": plot_departure_schedule,
@@ -805,28 +865,6 @@ TOOLS_SCHEMA = [
                         "type": "array",
                         "items": {"type": "integer"},
                         "description": "List of route_id integers for the identified line (all directions).",
-                    }
-                },
-                "required": ["route_ids"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "show_map",
-            "description": (
-                "Render a map of the stops for one or more route_ids. "
-                "Call this ONLY when the user explicitly asks for a map or to see stops on a map. "
-                "Returns rich stop data that will be rendered as an interactive map in the UI."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "route_ids": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "List of route_id integers to display on the map.",
                     }
                 },
                 "required": ["route_ids"],
