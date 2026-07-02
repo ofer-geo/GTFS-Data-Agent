@@ -669,7 +669,21 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
         for tool_call in tool_calls:
             func_name = tool_call.function.name
             tool_call_names[tool_call.id] = func_name
-            args = json.loads(tool_call.function.arguments) or {}
+            try:
+                args = json.loads(tool_call.function.arguments) or {}
+            except json.JSONDecodeError as e:
+                # Weaker fallback models (e.g. Groq's gpt-oss-20b/qwen3, several
+                # rungs down MODEL_PRIORITY) are far more prone to malformed
+                # tool-call JSON than the primary model. Left uncaught, this used
+                # to crash the whole request right after a model switch. Feed it
+                # back as a tool result (keeps the tool_call/tool_result pairing
+                # valid for OpenAI/Groq) so the model can just retry.
+                print(f"[Agent] Malformed tool call args from {model} for {func_name}: {tool_call.function.arguments[:200]!r}")
+                result = f"Error: tool call arguments were not valid JSON ({e}). Retry with valid JSON arguments."
+                log.append({"type": "action", "tool": func_name, "args": {}, "observation": result})
+                yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                _append_tool_result(messages, tool_call.id, func_name, result, provider, current_response)
+                continue
 
             if func_name == "get_line_variants":
                 args = {k: v for k, v in args.items() if k in {"line_number", "agency_name"}}
@@ -689,7 +703,16 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             if func_name not in tools_map:
                 result = f"Error: tool '{func_name}' does not exist."
             else:
-                result = tools_map[func_name](**args)
+                try:
+                    result = tools_map[func_name](**args)
+                except Exception as e:
+                    # A weak fallback model can pass wrong/extra argument names,
+                    # raising before the tool's own internal error handling runs
+                    # (e.g. select_option's int(option_number) on a non-numeric
+                    # value). Surface it as a tool error instead of crashing the
+                    # whole request.
+                    print(f"[Agent] Tool call failed - {func_name}({args}): {type(e).__name__}: {e}")
+                    result = f"Error calling {func_name}({args}): {e}"
                 tool_calls_made += 1
 
             try:
