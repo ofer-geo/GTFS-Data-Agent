@@ -76,8 +76,8 @@ It is downloaded once and loaded into a local in-memory **DuckDB** database, so 
 
 ### 1. Clone and enter the project
 ```bash
-git clone https://github.com/ofer-geo/SIRI-Data-Agent.git
-cd SIRI-Data-Agent
+git clone https://github.com/ofer-geo/GTFS-Data-Agent.git
+cd GTFS-Data-Agent
 ```
 
 ### 2. Create a virtual environment and install dependencies
