@@ -35,13 +35,42 @@ _SCHEDULE_KEYWORDS = _TIMETABLE_KEYWORDS | _FREQUENCY_KEYWORDS | {
 }
 
 
-def get_messages(history, provider) -> list:
+def get_messages(history, provider, line_context: dict = None) -> list:
     if isinstance(history, str):
         history = [{"role": "user", "content": history}]
 
     pending = selection_state.get("pending_type")
 
     system = SYSTEM_PROMPT
+
+    # Persistent memory of the line resolved earlier in this conversation -
+    # independent of `pending` (which only covers the immediate next reply).
+    # Without this the model has to re-infer the line from prior chat text,
+    # which weaker fallback models do unreliably (they just re-ask instead).
+    if line_context and line_context.get("route_ids"):
+        given = line_context.get("given", {})
+        given_bits = []
+        if given.get("stops"):
+            given_bits.append("stop list already shown")
+        if given.get("timetable_days"):
+            given_bits.append(f"timetable already shown for: {', '.join(sorted(given['timetable_days']))}")
+        if given.get("frequency_chart"):
+            given_bits.append("frequency chart already shown")
+        directions = line_context.get("directions") or []
+        dir_text = (
+            "; ".join(f"{d.get('headsign', '?')} (route_id={d.get('route_id')})" for d in directions)
+            if directions else "not yet listed"
+        )
+        system += (
+            f"\n\n⚠️ CONVERSATION CONTEXT: Line {line_context.get('line_number')} operated by "
+            f"{line_context.get('agency')} was already identified earlier in this conversation "
+            f"(route_ids={line_context.get('route_ids')}). Directions: {dir_text}. "
+            + (f"Already given this conversation: {'; '.join(given_bits)}. " if given_bits else "")
+            + "If the user's new question is about this same line and does not name a different "
+              "line number, reuse these route_ids directly — do NOT call get_line_variants again "
+              "and do NOT ask the user for the line number or agency again."
+        )
+
     if pending == "direction":
         directions = selection_state.get("directions", [])
         all_route_ids = selection_state.get("all_route_ids", [])
@@ -425,10 +454,16 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
     system = (
         "You are reviewing a draft answer to a user's public-transport question. "
         "Check: (1) does it fully answer what was asked, (2) is it clear and "
-        "user-friendly (lists for multiple items, stop codes included, no raw "
-        "SQL/JSON). If it already satisfies both, output it completely unchanged. "
-        "Otherwise, output a corrected version. Output ONLY the final answer text - "
-        "no meta-commentary about the review."
+        "user-friendly (lists for multiple items, no raw SQL/JSON). "
+        "STRICT RULE: you may only reformat, reorganize, or clarify wording that is "
+        "already in the draft below. You have no access to the real database, so you "
+        "MUST NOT add, complete, or 'fill in' any number, time, stop name, stop code, "
+        "or statistic that is not already written in the draft - not even a plausible-"
+        "looking one. If the draft is missing a detail, leave it missing; do not invent "
+        "it for the sake of looking complete. "
+        "If the draft already satisfies both checks, output it completely unchanged. "
+        "Otherwise, output a corrected version that only rearranges/clarifies existing "
+        "content. Output ONLY the final answer text - no meta-commentary about the review."
     )
     user = f"User's question:\n{question}\n\nDraft answer:\n{draft}"
     try:
@@ -451,11 +486,17 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
         return draft
 
 
-def react_agent(question: str, context: list = None, max_steps: int = 15, stop_event=None):
+def react_agent(question: str, context: list = None, max_steps: int = 15, stop_event=None, line_context: dict = None):
     """
     question: the current user message (string)
     context:  previous conversation turns as [{"role": ..., "content": ...}, ...]
               pass None or [] for a fresh conversation
+    line_context: persisted summary of the line resolved earlier in this
+              conversation (line_number/agency/route_ids/directions/given),
+              as last yielded by a prior call - pass None for a fresh
+              conversation. Threaded into get_messages() so the model doesn't
+              have to re-derive an already-known line from raw chat text, and
+              updated here as the conversation progresses.
 
     Model selection is automatic: starts at MODEL_PRIORITY[0] and, on a
     rate-limit/quota error, silently advances to the next entry (logged as a
@@ -465,9 +506,14 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
     provider, model = MODEL_PRIORITY[model_idx]
     client = get_client(provider)
 
+    line_context = dict(line_context) if line_context else {
+        "line_number": None, "agency": None, "route_ids": [], "directions": None, "given": {},
+    }
+    line_context.setdefault("given", {})
+
     history = list(context or []) + [{"role": "user", "content": question}]
     print(f"[Agent] New query -> provider={provider!r} model={model!r}")
-    messages = get_messages(history, provider)
+    messages = get_messages(history, provider, line_context=line_context)
 
     # If nothing in this conversation has named timetable/frequency yet, the model
     # must ask before jumping straight to one - enforced below rather than left to
@@ -500,6 +546,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
         if wants_frequency and sched_route_ids:
             selection_state.update({"pending_type": None, "schedule_route_ids": [], "schedule_agency": None, "schedule_line_number": None})
+            line_context = {
+                "line_number": sched_line_num, "agency": sched_agency, "route_ids": sched_route_ids,
+                "directions": line_context.get("directions"),
+                "given": {**line_context.get("given", {}), "frequency_chart": True},
+            }
             sched_result = tools_map["get_departure_schedule"](route_ids=sched_route_ids)
             plot_result = tools_map["plot_departure_schedule"](route_ids=sched_route_ids)
             fast_log = [
@@ -507,24 +558,30 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 {"type": "action", "tool": "plot_departure_schedule", "args": {"route_ids": sched_route_ids}, "observation": plot_result[:500]},
             ]
             cd = extract_chart_data(plot_result)
-            yield {"status": "step", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": cd, "timetable_data": None, "answer": None}
+            yield {"status": "step", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": cd, "timetable_data": None, "line_context": line_context, "answer": None}
             summary = _summarize_frequency(question, sched_line_num, sched_agency, sched_result, provider, model, client)
-            yield {"status": "done", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": cd, "timetable_data": None, "answer": summary}
+            yield {"status": "done", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": cd, "timetable_data": None, "line_context": line_context, "answer": summary}
             return
 
         if wants_timetable and sched_route_ids:
             day = _extract_day(q_lower)
             if day:
                 selection_state.update({"pending_type": None, "schedule_route_ids": [], "schedule_agency": None, "schedule_line_number": None})
+                days = sorted(set(line_context.get("given", {}).get("timetable_days", [])) | {day})
+                line_context = {
+                    "line_number": sched_line_num, "agency": sched_agency, "route_ids": sched_route_ids,
+                    "directions": line_context.get("directions"),
+                    "given": {**line_context.get("given", {}), "timetable_days": days},
+                }
                 tt_result = tools_map["get_departure_timetable"](route_ids=sched_route_ids, specific_day=day)
                 fast_log = [{"type": "action", "tool": "get_departure_timetable", "args": {"route_ids": sched_route_ids, "specific_day": day}, "observation": tt_result[:500]}]
                 td = extract_timetable_data(tt_result)
-                yield {"status": "step", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": None, "timetable_data": td, "answer": None}
+                yield {"status": "step", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": None, "timetable_data": td, "line_context": line_context, "answer": None}
                 if _is_hebrew(question):
                     answer = f"הנה לוח הזמנים לקו {sched_line_num} ({sched_agency}) ליום {day}:"
                 else:
                     answer = f"Here is the timetable for line {sched_line_num} ({sched_agency}) on {day.capitalize()}:"
-                yield {"status": "done", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": None, "timetable_data": td, "answer": answer}
+                yield {"status": "done", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": None, "timetable_data": td, "line_context": line_context, "answer": answer}
                 return
             # no day mentioned yet - fall through to the normal LLM flow, which is
             # now informed via get_messages()'s schedule_choice branch and will ask for it
@@ -539,6 +596,36 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
     tool_call_names = {}  # call_id → func_name, used for trimming
     pending_plot_args = None  # set after get_departure_schedule until plot_departure_schedule runs
     data_tool_used = False  # set once a real answer-producing tool (stops/map/sql/schedule) has run
+
+    _retry_reason = None
+    _retry_count = 0
+
+    def _bail_if_stuck(reason_key: str) -> bool:
+        """
+        Generic circuit breaker for the deterministic "model didn't do what
+        we told it to" nudges below (tool_use_failed, tool-call-as-text,
+        missing plot_departure_schedule call, no tool called at all). If the
+        exact same corrective nudge fires twice in a row with no successful
+        tool call in between, the model can't escape the loop on its own -
+        stop burning the max_steps budget on slow round-trips and surface a
+        clear message instead of silently grinding to "Max steps reached"
+        after minutes of retries (see: a resolved line + a legitimate
+        clarifying question like "which day?" being mistaken for a fresh,
+        ungrounded answer, over and over).
+        """
+        nonlocal _retry_reason, _retry_count
+        if _retry_reason == reason_key:
+            _retry_count += 1
+        else:
+            _retry_reason = reason_key
+            _retry_count = 1
+        return _retry_count >= 2
+
+    def _stuck_answer() -> str:
+        if _is_hebrew(question):
+            return "מצטער, נתקלתי בקושי לעבד את הבקשה הזו — תוכל לנסח אותה מחדש?"
+        return "I'm having trouble processing this — could you rephrase your question?"
+
     for step in range(max_steps):
 
         # --- Trim previous tool results to summaries before next LLM call ---
@@ -547,7 +634,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
         # --- Check stop request ---
         if stop_event and stop_event.is_set():
-            yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": "Stopped by user."}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": "Stopped by user."}
             return
 
         # --- Call the LLM ---
@@ -559,6 +646,9 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             print(f"[Agent] LLM error - type={type(e).__name__!r} status={status!r} msg={es[:300]!r}")
 
             if "tool_use_failed" in es or (status == 400 and "tool" in es.lower()):
+                if _bail_if_stuck("tool_use_failed"):
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    return
                 log.append({"type": "retry", "text": "tool_use_failed - retrying"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                 messages.append({"role": "user", "content":
@@ -604,10 +694,18 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             raise
 
         content, tool_calls = _parse_response(current_response, provider)
+        if tool_calls:
+            # Real progress - the model produced a valid tool call, so the
+            # circuit breaker's "same nudge fired twice in a row" tracking
+            # no longer applies to whatever it was stuck on before.
+            _retry_reason = None
 
         # --- No tool call: final answer ---
         if not tool_calls:
             if '"type": "function"' in content or ('"name":' in content and '"arguments":' in content):
+                if _bail_if_stuck("tool_call_as_text"):
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    return
                 log.append({"type": "retry", "text": "model emitted tool call as text - retrying"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                 messages.append({"role": "user", "content":
@@ -625,6 +723,9 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 return
 
             if pending_plot_args is not None:
+                if _bail_if_stuck("missing_plot_call"):
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    return
                 log.append({"type": "retry", "text": "must call plot_departure_schedule before finishing - retrying"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                 messages.append({"role": "user", "content":
@@ -633,8 +734,20 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     f"specific_day={pending_plot_args['specific_day']!r}) now, then give your final answer."})
                 continue
 
-            if tool_calls_made == 0:
-                # Only force a tool call if the question is about transport data
+            already_grounded = (
+                bool(line_context.get("route_ids"))
+                or data_tool_used
+                or selection_state.get("pending_type") is not None
+            )
+            if tool_calls_made == 0 and not already_grounded:
+                # Only force a tool call if NOTHING in this conversation has
+                # touched real data yet (no resolved line, no tool call this
+                # turn, no in-progress multi-turn flow) - i.e. a genuinely
+                # fresh, ungrounded transport question the model might
+                # otherwise answer from memory. Once anything is grounded, a
+                # plain-text answer (including a legitimate clarifying
+                # question, e.g. "which day?" mid schedule-choice) is allowed
+                # through instead of being wrongly forced back into a tool call.
                 transport_keywords = {"line", "stop", "route", "bus", "operator", "agency", "קו", "תחנה", "מפעיל"}
                 first_user_msg = next(
                     (m["content"] for m in messages if m.get("role") == "user" and isinstance(m.get("content"), str)),
@@ -642,6 +755,9 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 )
                 is_transport = any(kw in first_user_msg.lower() for kw in transport_keywords)
                 if is_transport:
+                    if _bail_if_stuck("no_tool_called"):
+                        yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                        return
                     log.append({"type": "retry", "text": "model answered without calling any tool - retrying"})
                     yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                     messages.append({"role": "user", "content":
@@ -654,7 +770,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             log.append({"type": "verify", "text": "checking the answer against the question"})
             yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
             content = _verify_answer(question, content, provider, model, client)
-            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": content}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": content}
             return
 
         # --- Tool calls: execute and feed results back ---
@@ -694,7 +810,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 # on-template reply - that round trip has drifted into long, unrelated
                 # "what do you mean?" answers on some fallback models.
                 answer = _schedule_type_question(history)
-                yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": answer}
+                yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": answer}
                 return
 
             yield {"status": "calling", "tool": func_name, "args": args,
@@ -744,9 +860,38 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 if td:
                     timetable_data = td
 
+            # --- Keep the persistent line-context summary current ---
+            # (see get_messages()'s CONVERSATION CONTEXT block) so a later turn
+            # doesn't have to re-derive the line, its directions, or what's
+            # already been shown from raw chat text.
+            try:
+                result_obj = json.loads(result)
+            except (json.JSONDecodeError, TypeError):
+                result_obj = None
+
+            if line_context.get("route_ids"):
+                if func_name == "get_line_directions" and isinstance(result_obj, dict) and result_obj.get("directions"):
+                    line_context["directions"] = [
+                        {"headsign": d.get("headsign"), "route_id": d.get("route_id")}
+                        for d in result_obj["directions"]
+                    ]
+                elif func_name == "get_line_stops" and isinstance(result_obj, list):
+                    line_context["given"]["stops"] = True
+                    if not line_context.get("directions"):
+                        line_context["directions"] = [
+                            {"headsign": d.get("headsign"), "route_id": d.get("route_id")}
+                            for d in result_obj
+                        ]
+                elif func_name == "get_departure_timetable" and isinstance(result_obj, dict) and result_obj.get("day"):
+                    days = set(line_context["given"].get("timetable_days", []))
+                    days.add(result_obj["day"])
+                    line_context["given"]["timetable_days"] = sorted(days)
+                elif func_name == "plot_departure_schedule":
+                    line_context["given"]["frequency_chart"] = True
+
             log.append({"type": "action", "tool": func_name, "args": args, "observation": result[:500]})
             coords += extract_coords(result)
-            yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+            yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": None}
 
             trimmed = result if len(result) <= MAX_OBS_CHARS else result[:MAX_OBS_CHARS] + "\n...[truncated]"
             _append_tool_result(messages, tool_call.id, func_name, trimmed, provider, current_response)
@@ -762,6 +907,14 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             line_num = last_parsed.get("line_number", "")
             ids_str = ", ".join(str(r) for r in route_ids)
 
+            # Fresh resolution - replaces whatever line was previously tracked
+            # (same line asked again, or a genuinely different one either way
+            # this is now the authoritative current line for the conversation).
+            line_context = {
+                "line_number": line_num, "agency": agency, "route_ids": route_ids,
+                "directions": None, "given": {},
+            }
+
             # Automatically plot the route map the moment a line is resolved -
             # deterministic, not something the model decides to call, so a map
             # reliably accompanies every answer about a specific line regardless
@@ -771,22 +924,24 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             if md:
                 map_data = md
                 log.append({"type": "action", "tool": "plot_route_map", "args": {"route_ids": route_ids}, "observation": map_result[:500]})
-                yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": None}
 
-            # Auto-build the Tuesday frequency chart for the resolved line,
-            # same pattern as the map above (route_ids exist here).
+            # Auto-build the frequency chart (working days / Friday / Saturday
+            # breakdown) for the resolved line, same pattern as the map above
+            # (route_ids exist here).
             try:
                 from agent.tools import plot_departure_schedule
-                chart_result = plot_departure_schedule(route_ids, specific_day="tuesday")
+                chart_result = plot_departure_schedule(route_ids)
                 cd = extract_chart_data(chart_result)
                 if cd:
                     chart_data = cd
+                    line_context["given"]["frequency_chart"] = True
                     log.append({"type": "action", "tool": "plot_departure_schedule",
-                                "args": {"route_ids": route_ids, "specific_day": "tuesday"},
+                                "args": {"route_ids": route_ids},
                                 "observation": chart_result[:500]})
                     yield {"status": "step", "log": list(log), "coords": list(coords),
                            "map_data": map_data, "chart_data": chart_data,
-                           "timetable_data": timetable_data, "answer": None}
+                           "timetable_data": timetable_data, "line_context": line_context, "answer": None}
             except Exception as e:
                 print(f"[Agent] Auto-chart failed: {e}")
 
@@ -884,7 +1039,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     })
                     yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
 
-            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": content}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": content}
             return
 
-    yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "answer": "Max steps reached"}
+    yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "line_context": line_context, "answer": "Max steps reached"}

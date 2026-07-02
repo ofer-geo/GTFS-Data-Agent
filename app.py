@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
-import pydeck as pdk
+import plotly.graph_objects as go
 import plotly.io as pio
-import plotly.express as px
 import threading
 import queue
 import time
@@ -126,43 +125,25 @@ from agent import tools as _tools
 _tools.set_connection(load_gtfs())
 
 
-@st.cache_data(show_spinner=False)
-def _agency_lines_chart_json():
-    conn = load_gtfs()
-    rows = conn.execute("""
-        SELECT a.agency_name,
-               COUNT(DISTINCT regexp_extract(r.route_desc, '[0-9]{5}')) AS line_count
-        FROM routes r
-        JOIN agency a ON r.agency_id = a.agency_id
-        WHERE r.route_desc IS NOT NULL
-          AND regexp_extract(r.route_desc, '[0-9]{5}') != ''
-        GROUP BY a.agency_name
-        ORDER BY line_count DESC
-        LIMIT 10
-    """).fetchall()
-    df = pd.DataFrame(rows, columns=["Agency", "Lines"])
-    fig = px.bar(
-        df, x="Agency", y="Lines",
-        title="Top 10 agencies by number of lines",
-        color_discrete_sequence=["#3b82f6"],
-    )
-    fig.update_layout(
-        height=300,
-        margin=dict(l=40, r=20, t=50, b=120),
-        showlegend=False,
-        xaxis_title="",
-        yaxis_title="Number of lines",
-    )
-    fig.update_xaxes(tickangle=40)
-    return fig.to_json()
-
-
 def render_israel_overview_map():
-    st.pydeck_chart(pdk.Deck(
-        layers=[],
-        initial_view_state=pdk.ViewState(latitude=31.5, longitude=34.85, zoom=7, pitch=0),
-        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-    ), height=320, use_container_width=True)
+    # Same Plotly/mapbox technology and MAP_STYLE as render_route_map, so the
+    # basemap never visibly changes when a route map replaces this view -
+    # only the zoom/bounds differ (whole country vs. one line's stops).
+    bounds = _tools.ISRAEL_BOUNDS
+    zoom = _tools.fit_bounds_zoom(
+        bounds["min_lat"], bounds["max_lat"], bounds["min_lon"], bounds["max_lon"],
+        padding=0.08,
+    )
+    center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
+    center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
+
+    fig = go.Figure(go.Scattermapbox(lat=[], lon=[]))
+    fig.update_layout(
+        mapbox=dict(style=_tools.MAP_STYLE, center=dict(lat=center_lat, lon=center_lon), zoom=zoom),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=_tools.MAP_HEIGHT,
+    )
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
 
 
 # --- Session state defaults ---
@@ -177,6 +158,7 @@ for key, default in {
     "agent_timetable_data": None,
     "agent_answer": None,
     "stop_event": None,
+    "line_context": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -270,11 +252,11 @@ def render_route_map(map_data: dict):
         st.error(f"Map render error: {e}")
 
 
-def _agent_thread(question, context, result_queue, stop_event):
+def _agent_thread(question, context, result_queue, stop_event, line_context):
     from agent.core import react_agent
     log = []
     try:
-        for update in react_agent(question, context=context, stop_event=stop_event):
+        for update in react_agent(question, context=context, stop_event=stop_event, line_context=line_context):
             log = update.get("log", log)
             result_queue.put(update)
     except Exception as e:
@@ -308,6 +290,7 @@ with st.sidebar:
                  disabled=st.session_state.agent_running):
         st.session_state["chat_history"] = []
         st.session_state["agent_map_data"] = None
+        st.session_state["line_context"] = None
         st.rerun()
 
 
@@ -352,17 +335,16 @@ with col_viz:
                     break
 
         # If no chart was produced but a route map is showing, build the
-        # Tuesday frequency chart from that same line's route_ids.
+        # default frequency chart (working days / Friday / Saturday
+        # breakdown) from that same line's route_ids.
         if not display_chart and display_map and display_map.get("route_ids"):
             try:
-                chart_json = _tools.plot_departure_schedule(
-                    display_map["route_ids"], specific_day="tuesday"
-                )
+                chart_json = _tools.plot_departure_schedule(display_map["route_ids"])
                 cd = json.loads(chart_json)
                 if cd.get("chart_type") == "departure_schedule":
                     display_chart = cd
             except Exception as e:
-                st.caption(f"(Could not build Tuesday chart: {e})")
+                st.caption(f"(Could not build frequency chart: {e})")
 
         if display_chart:
             try:
@@ -371,16 +353,12 @@ with col_viz:
             except Exception as e:
                 st.error(f"Chart render error: {e}")
         else:
-            try:
-                default_fig = pio.from_json(_agency_lines_chart_json())
-                st.plotly_chart(default_fig, use_container_width=True)
-            except Exception:
-                st.markdown(
-                    "<div class='viz-placeholder' style='height:180px'>"
-                    "Chart will appear here based on your question"
-                    "</div>",
-                    unsafe_allow_html=True,
-                )
+            st.markdown(
+                "<div class='viz-placeholder' style='height:180px'>"
+                "Chart will appear here based on your question"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # ── Vertical separator between columns ──
@@ -450,6 +428,8 @@ with col_chat:
                     st.session_state.agent_chart_data = update["chart_data"]
                 if update.get("timetable_data"):
                     st.session_state.agent_timetable_data = update["timetable_data"]
+                if update.get("line_context"):
+                    st.session_state.line_context = update["line_context"]
                 if update.get("answer"):
                     st.session_state.agent_answer = update["answer"]
 
@@ -525,7 +505,7 @@ with col_chat:
             t = threading.Thread(
                 target=_agent_thread,
                 args=(question, context, st.session_state.agent_queue,
-                      st.session_state.stop_event),
+                      st.session_state.stop_event, st.session_state.line_context),
                 daemon=True,
             )
             t.start()
