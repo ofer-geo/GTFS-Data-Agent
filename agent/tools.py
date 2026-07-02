@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import duckdb
 import plotly.graph_objects as go
@@ -362,6 +363,50 @@ def get_line_directions(route_ids: list) -> str:
 # Distinct colors per direction, reused across the map's line + stop-marker traces
 _MAP_COLORS = ["#dc2626", "#2563eb", "#10b981", "#f59e0b", "#8b5cf6"]
 
+# Shared by every map shown in the app (overview + route maps) so the basemap
+# style and rendered size never visibly change between them.
+MAP_STYLE = "carto-positron"
+MAP_HEIGHT = 460
+MAP_WIDTH = 620  # approximate rendered width of the viz column; only used to scale zoom
+
+# Israel's bounding box (Eilat to the northern border, coast to the Jordan
+# Valley) - used to zoom the empty overview map out to show the whole country.
+ISRAEL_BOUNDS = {"min_lat": 29.45, "max_lat": 33.35, "min_lon": 34.2, "max_lon": 35.95}
+
+
+def _lat_rad(lat: float) -> float:
+    s = min(max(math.sin(math.radians(lat)), -0.9999), 0.9999)
+    return math.log((1 + s) / (1 - s)) / 2
+
+
+def fit_bounds_zoom(min_lat, max_lat, min_lon, max_lon,
+                     map_width=MAP_WIDTH, map_height=MAP_HEIGHT,
+                     padding=0.15, max_zoom=15.0) -> float:
+    """
+    Standard "fit bounds" zoom calculation (the same approach Google Maps/
+    Mapbox use): find the largest zoom level at which the given lat/lon
+    bounding box still fits inside a map_width x map_height viewport, with
+    `padding` fraction of the viewport reserved as margin so points don't
+    sit flush against the edge.
+    """
+    world_dim = 256
+
+    lat_fraction = (_lat_rad(max_lat) - _lat_rad(min_lat)) / math.pi
+    lon_diff = max_lon - min_lon
+    if lon_diff < 0:
+        lon_diff += 360
+    lon_fraction = lon_diff / 360
+
+    eff_width = map_width * (1 - padding)
+    eff_height = map_height * (1 - padding)
+
+    def zoom_for(map_px, fraction):
+        if fraction <= 0:
+            return max_zoom
+        return math.log2(map_px / world_dim / fraction)
+
+    return max(1.0, min(zoom_for(eff_height, lat_fraction), zoom_for(eff_width, lon_fraction), max_zoom))
+
 
 def plot_route_map(route_ids: list, line_num: str = None, agency: str = None) -> str:
     """
@@ -433,6 +478,7 @@ def plot_route_map(route_ids: list, line_num: str = None, agency: str = None) ->
 
         mid_lat = sum(all_lats) / len(all_lats)
         mid_lon = sum(all_lons) / len(all_lons)
+        zoom = fit_bounds_zoom(min(all_lats), max(all_lats), min(all_lons), max(all_lons))
 
         title_text = "Route map"
         if line_num or agency:
@@ -440,9 +486,9 @@ def plot_route_map(route_ids: list, line_num: str = None, agency: str = None) ->
 
         fig.update_layout(
             title=dict(text=title_text, y=0.99, yanchor="top"),
-            mapbox=dict(style="open-street-map", center=dict(lat=mid_lat, lon=mid_lon), zoom=12),
+            mapbox=dict(style=MAP_STYLE, center=dict(lat=mid_lat, lon=mid_lon), zoom=zoom),
             margin=dict(l=0, r=0, t=80, b=0),
-            height=420,
+            height=MAP_HEIGHT,
             updatemenus=[dict(
                 buttons=buttons, direction="down", x=0, y=0.99,
                 xanchor="left", yanchor="top", showactive=True,
