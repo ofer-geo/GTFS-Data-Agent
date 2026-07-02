@@ -351,6 +351,19 @@ with col_viz:
                     display_chart = msg["chart_data"]
                     break
 
+        # If no chart was produced but a route map is showing, build the
+        # Tuesday frequency chart from that same line's route_ids.
+        if not display_chart and display_map and display_map.get("route_ids"):
+            try:
+                chart_json = _tools.plot_departure_schedule(
+                    display_map["route_ids"], specific_day="tuesday"
+                )
+                cd = json.loads(chart_json)
+                if cd.get("chart_type") == "departure_schedule":
+                    display_chart = cd
+            except Exception as e:
+                st.caption(f"(Could not build Tuesday chart: {e})")
+
         if display_chart:
             try:
                 fig = pio.from_json(display_chart["figure_json"])
