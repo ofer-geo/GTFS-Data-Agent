@@ -451,7 +451,7 @@ def plot_route_map(route_ids: list, line_num: str = None, agency: str = None) ->
             legend=dict(title="Direction", x=0, y=0),
         )
 
-        return json.dumps({"chart_type": "route_map", "figure_json": fig.to_json()}, ensure_ascii=False)
+        return json.dumps({"chart_type": "route_map", "figure_json": fig.to_json(), "route_ids": list(route_ids)}, ensure_ascii=False)
     except Exception as e:
         return f"Error: {e}"
 
@@ -637,12 +637,12 @@ def _build_departure_chart(route_departures_dict, specific_day=None):
             font=dict(size=24, family="Arial", color="black"),
             pad=dict(t=15),
         ),
-        height=650,
+        height=340,
         xaxis_title="Hour",
         yaxis_title="Average departures",
         barmode="group",
         legend_title="Type of day",
-        margin=dict(l=55, r=35, t=190, b=60),
+        margin=dict(l=55, r=35, t=120, b=40),
         updatemenus=[
             dict(buttons=direction_buttons, direction="down", x=0, y=1.27,
                  xanchor="left", yanchor="top", showactive=True),

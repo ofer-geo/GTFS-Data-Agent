@@ -773,6 +773,23 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 log.append({"type": "action", "tool": "plot_route_map", "args": {"route_ids": route_ids}, "observation": map_result[:500]})
                 yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
 
+            # Auto-build the Tuesday frequency chart for the resolved line,
+            # same pattern as the map above (route_ids exist here).
+            try:
+                from agent.tools import plot_departure_schedule
+                chart_result = plot_departure_schedule(route_ids, specific_day="tuesday")
+                cd = extract_chart_data(chart_result)
+                if cd:
+                    chart_data = cd
+                    log.append({"type": "action", "tool": "plot_departure_schedule",
+                                "args": {"route_ids": route_ids, "specific_day": "tuesday"},
+                                "observation": chart_result[:500]})
+                    yield {"status": "step", "log": list(log), "coords": list(coords),
+                           "map_data": map_data, "chart_data": chart_data,
+                           "timetable_data": timetable_data, "answer": None}
+            except Exception as e:
+                print(f"[Agent] Auto-chart failed: {e}")
+
             if must_ask_schedule_type and is_schedule_question:
                 # Persist the resolved line so the NEXT turn (the user's timetable-vs-
                 # frequency reply) doesn't have to re-derive it - chat history across
