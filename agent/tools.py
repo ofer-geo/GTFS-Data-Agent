@@ -366,7 +366,7 @@ _MAP_COLORS = ["#dc2626", "#2563eb", "#10b981", "#f59e0b", "#8b5cf6"]
 # Shared by every map shown in the app (overview + route maps) so the basemap
 # style and rendered size never visibly change between them.
 MAP_STYLE = "carto-positron"
-MAP_HEIGHT = 460
+MAP_HEIGHT = 300
 MAP_WIDTH = 620  # approximate rendered width of the viz column; only used to scale zoom
 
 # Israel's bounding box (Eilat to the northern border, coast to the Jordan
@@ -478,7 +478,7 @@ def plot_route_map(route_ids: list, line_num: str = None, agency: str = None) ->
 
         mid_lat = sum(all_lats) / len(all_lats)
         mid_lon = sum(all_lons) / len(all_lons)
-        zoom = fit_bounds_zoom(min(all_lats), max(all_lats), min(all_lons), max(all_lons))
+        zoom = fit_bounds_zoom(min(all_lats), max(all_lats), min(all_lons), max(all_lons), padding=0.25)
 
         title_text = "Route map"
         if line_num or agency:
@@ -487,7 +487,7 @@ def plot_route_map(route_ids: list, line_num: str = None, agency: str = None) ->
         fig.update_layout(
             title=dict(text=title_text, y=0.99, yanchor="top"),
             mapbox=dict(style=MAP_STYLE, center=dict(lat=mid_lat, lon=mid_lon), zoom=zoom),
-            margin=dict(l=0, r=0, t=80, b=0),
+            margin=dict(l=0, r=0, t=20, b=0),
             height=MAP_HEIGHT,
             updatemenus=[dict(
                 buttons=buttons, direction="down", x=0, y=0.99,
@@ -637,10 +637,7 @@ def _build_departure_chart(route_departures_dict, specific_day=None):
 
     def title_for(route_id):
         meta = route_meta[route_id]
-        return (
-            "Departures by line and hour"
-            f"<br><sup>Line {meta['route_short_name']} | {meta['agency_name']}</sup>"
-        )
+        return f"Line {meta['route_short_name']} | {meta['agency_name']} — departures per hour"
 
     direction_buttons = [
         dict(
@@ -679,26 +676,25 @@ def _build_departure_chart(route_departures_dict, specific_day=None):
     fig.update_layout(
         title=dict(
             text=title_for(route_ids[0]),
-            y=0.98, x=0.5, xanchor="center", yanchor="top",
-            font=dict(size=24, family="Arial", color="black"),
-            pad=dict(t=15),
+            y=0.99, x=0, xanchor="left", yanchor="top",
+            font=dict(size=15),
         ),
-        height=340,
+        height=300,
         xaxis_title="Hour",
         yaxis_title="Average departures",
         barmode="group",
         legend_title="Type of day",
-        margin=dict(l=55, r=35, t=120, b=40),
+        margin=dict(l=55, r=35, t=90, b=70),
         updatemenus=[
-            dict(buttons=direction_buttons, direction="down", x=0, y=1.27,
+            dict(buttons=direction_buttons, direction="down", x=0, y=1.30,
                  xanchor="left", yanchor="top", showactive=True),
-            dict(buttons=day_buttons, direction="down", x=0, y=1.13,
+            dict(buttons=day_buttons, direction="down", x=0.55, y=1.30,
                  xanchor="left", yanchor="top", showactive=True),
         ],
         annotations=[
-            dict(text="<b>Direction:</b>", x=0.00, y=1.32, xref="paper", yref="paper",
+            dict(text="<b>Direction:</b>", x=0.00, y=1.40, xref="paper", yref="paper",
                  showarrow=False, xanchor="left", yanchor="top"),
-            dict(text="<b>Type of day:</b>", x=0.00, y=1.18, xref="paper", yref="paper",
+            dict(text="<b>Type of day:</b>", x=0.55, y=1.40, xref="paper", yref="paper",
                  showarrow=False, xanchor="left", yanchor="top"),
         ],
     )
