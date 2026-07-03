@@ -508,7 +508,38 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
 _PLAN_GOAL_TYPES = {"count_stops", "get_agency", "get_first_stop", "get_last_stop"}
 
 
-def _build_plan(question: str, provider: str, model: str, client):
+def _call_with_fallback(model_idx: int, call_fn):
+    """
+    Tries MODEL_PRIORITY starting at model_idx, advancing on any retryable
+    error (rate limit/quota/overload) - same policy _call_llm's caller uses
+    in the main loop, factored out so a small side call like _build_plan
+    isn't stuck on whichever single model happened to be exhausted first.
+    call_fn: (provider, model, client) -> result (raises on failure)
+    Returns (result, model_idx_used) on success, or (None, model_idx) if the
+    whole remaining chain fails - deliberately does NOT do the main loop's
+    long wait-and-retry-same-model fallback, since this is meant to stay
+    cheap: better to skip the sequencer for this turn than block on it.
+    """
+    idx = model_idx
+    while idx < len(MODEL_PRIORITY):
+        provider, model = MODEL_PRIORITY[idx]
+        client = get_client(provider)
+        try:
+            return call_fn(provider, model, client), idx
+        except Exception as e:
+            es = str(e)
+            status = getattr(e, "status_code", None)
+            if _is_retryable_error(es, status) and idx + 1 < len(MODEL_PRIORITY):
+                print(f"[Agent] {MODEL_PRIORITY[idx]} failed ({_detect_limit_type(es)}) "
+                      f"building the plan - trying {MODEL_PRIORITY[idx + 1]}")
+                idx += 1
+                continue
+            print(f"[Agent] Plan build failed on {provider}/{model}: {e}")
+            return None, idx
+    return None, idx
+
+
+def _build_plan(question: str, model_idx: int):
     """
     One small LLM call - same pattern as _verify_answer and
     _summarize_frequency: its own narrow system prompt, kept separate from
@@ -516,8 +547,11 @@ def _build_plan(question: str, provider: str, model: str, client):
     multiple lines resolved, and if so, breaks it into sub-goals from a
     closed goal_type enum mapped directly onto existing tools - so it can
     misjudge which lines are involved, but can never invent a new tool or
-    approach. Returns None whenever a single-line answer is more appropriate
-    (including on any parse/API failure) - the normal loop handles those.
+    approach. Tries the model fallback chain via _call_with_fallback rather
+    than giving up on the first provider. Returns (plan_or_None, model_idx) -
+    plan is None whenever a single-line answer is more appropriate (including
+    when the whole chain fails) - the normal loop handles those, continuing
+    from the returned model_idx so a known-exhausted model isn't retried again.
     """
     try:
         agency_rows = json.loads(tools_map["run_sql"]("SELECT DISTINCT agency_name FROM agency"))
@@ -544,7 +578,7 @@ def _build_plan(question: str, provider: str, model: str, client):
         "Valid agency_name values (copy one of these exactly, do not translate or "
         "respell it yourself): " + ", ".join(known_agencies)
     )
-    try:
+    def _call(provider, model, client):
         if provider == "anthropic":
             resp = client.messages.create(
                 model=model, max_tokens=400, system=system,
@@ -563,25 +597,26 @@ def _build_plan(question: str, provider: str, model: str, client):
         cleaned = text.strip().strip("`")
         if cleaned.lower().startswith("json"):
             cleaned = cleaned[4:].strip()
-        data = json.loads(cleaned)
+        return json.loads(cleaned)
 
-        subgoals = [
-            s for s in data.get("subgoals", [])
-            if isinstance(s, dict) and s.get("goal_type") in _PLAN_GOAL_TYPES and s.get("target")
-        ]
-        if len(subgoals) < 2:
-            return None
+    data, model_idx = _call_with_fallback(model_idx, _call)
+    if not data:
+        return None, model_idx
 
-        return {
-            "subgoals": subgoals,
-            "results": {},
-            "current_index": 0,
-            "compare": data.get("compare", ""),
-            "original_question": question,
-        }
-    except Exception as e:
-        print(f"[Agent] Plan build failed: {e}")
-        return None
+    subgoals = [
+        s for s in data.get("subgoals", [])
+        if isinstance(s, dict) and s.get("goal_type") in _PLAN_GOAL_TYPES and s.get("target")
+    ]
+    if len(subgoals) < 2:
+        return None, model_idx
+
+    return {
+        "subgoals": subgoals,
+        "results": {},
+        "current_index": 0,
+        "compare": data.get("compare", ""),
+        "original_question": question,
+    }, model_idx
 
 
 def _dispatch_goal(subgoal: dict, resolved: dict):
@@ -694,10 +729,14 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             # below will re-surface the same clarification for this sub-goal
 
     elif plan_state is None:
-        candidate = _build_plan(question, provider, model, client)
+        candidate, model_idx = _build_plan(question, model_idx)
+        if model_idx < len(MODEL_PRIORITY):
+            provider, model = MODEL_PRIORITY[model_idx]
+            client = get_client(provider)
         if candidate:
             plan_state = candidate
-            print(f"[Agent] Scoped sequencer engaged: {len(candidate['subgoals'])} sub-goal(s)")
+            print(f"[Agent] Scoped sequencer engaged: {len(candidate['subgoals'])} sub-goal(s), "
+                  f"using {provider}/{model}")
 
     if plan_state:
         while plan_state["current_index"] < len(plan_state["subgoals"]):
