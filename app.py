@@ -44,7 +44,18 @@ h1 { font-weight: 800 !important; letter-spacing: -0.02em; }
     border: 1px solid #e3e6ea;
     transition: all .12s ease;
     text-align: left;
+    justify-content: flex-start;
 }
+            
+[data-testid="stSidebar"] .stButton button {
+    justify-content: flex-start !important;
+}
+[data-testid="stSidebar"] .stButton button p,
+[data-testid="stSidebar"] .stButton button div {
+    text-align: left !important;
+    width: 100%;
+}
+                        
 [data-testid="stSidebar"] .stButton button:hover {
     border-color: #3b82f6;
     color: #3b82f6;
@@ -285,7 +296,7 @@ with st.sidebar:
         if st.button(ex, use_container_width=True, disabled=st.session_state.agent_running):
             st.session_state["pending_question"] = ex
 
-    st.divider()
+    st.markdown("<div style='height:30vh'></div>", unsafe_allow_html=True)
     if st.button("New conversation", use_container_width=True,
                  disabled=st.session_state.agent_running):
         st.session_state["chat_history"] = []

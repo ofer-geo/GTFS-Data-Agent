@@ -621,7 +621,7 @@ def _build_departure_chart(route_departures_dict, specific_day=None):
                 x=all_hours,
                 y=[data.get(day_type, {}).get(hour, 0) for hour in all_hours],
                 name=day_labels[day_type],
-                visible=(route_id == route_ids[0] and day_type == day_types[0]),
+                visible=(route_id == route_ids[0]),
                 legendgroup=day_type,
             ))
             trace_map[route_id][day_type] = trace_index
@@ -688,13 +688,13 @@ def _build_departure_chart(route_departures_dict, specific_day=None):
         updatemenus=[
             dict(buttons=direction_buttons, direction="down", x=0, y=1.30,
                  xanchor="left", yanchor="top", showactive=True),
-            dict(buttons=day_buttons, direction="down", x=0.55, y=1.30,
+            dict(buttons=day_buttons, direction="down", x=0.75, y=1.30,
                  xanchor="left", yanchor="top", showactive=True),
         ],
         annotations=[
-            dict(text="<b>Direction:</b>", x=0.00, y=1.40, xref="paper", yref="paper",
+            dict(text="<b>Direction:</b>", x=0.00, y=1.45, xref="paper", yref="paper",
                  showarrow=False, xanchor="left", yanchor="top"),
-            dict(text="<b>Type of day:</b>", x=0.55, y=1.40, xref="paper", yref="paper",
+            dict(text="<b>Type of day:</b>", x=0.75, y=1.45, xref="paper", yref="paper",
                  showarrow=False, xanchor="left", yanchor="top"),
         ],
     )
