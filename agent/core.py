@@ -683,8 +683,19 @@ def _resolve_current_subgoal(plan_state: dict):
             intro = (f"קו {subgoal['target']} מופעל על ידי יותר ממפעיל אחד — לאיזה מהם התכוונת?" if hebrew
                       else f"Line {subgoal['target']} is operated by more than one agency — which one did you mean?")
         else:
-            intro = (f"לקו {subgoal['target']} יש יותר ממסלול אחד — לאיזה מהם התכוונת?" if hebrew
-                      else f"Line {subgoal['target']} has more than one route — which one did you mean?")
+            # "route" here means 2+ unrelated line groups happen to share this
+            # display number under the same agency (e.g. a Tel Aviv service
+            # and a Beer Sheva service both labeled "126") - NOT directions of
+            # one line, which is a separate concept (get_line_directions).
+            # Saying "route" reads as ambiguous with "direction" to a user who
+            # doesn't know the internal terminology, so spell out "line" instead.
+            agency = data.get("agency_name") or subgoal.get("agency_name") or ""
+            if hebrew:
+                intro = (f"יש יותר מקו אחד עם המספר {subgoal['target']}"
+                          + (f" של {agency}" if agency else "") + " — לאיזה מהם התכוונת?")
+            else:
+                intro = (f"There's more than one line numbered {subgoal['target']}"
+                          + (f" operated by {agency}" if agency else "") + " — which one did you mean?")
         prompt = "אנא הזן מספר." if hebrew else "Please enter a number."
         # \n\n (not a single \n) so Markdown breaks out of the numbered list
         # into a new paragraph, instead of gluing this onto the last item.
