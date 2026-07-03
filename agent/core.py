@@ -5,7 +5,7 @@ import re
 from config import MODEL_PRIORITY
 from agent.tools import (
     tools_map, TOOLS_SCHEMA, selection_state, plot_route_map,
-    get_line_variants, get_line_stops, select_option,
+    get_line_variants, get_line_stops, select_option, get_agency_names,
 )
 from agent.prompts import SYSTEM_PROMPT
 from agent.utils import get_client
@@ -553,11 +553,14 @@ def _build_plan(question: str, model_idx: int):
     when the whole chain fails) - the normal loop handles those, continuing
     from the returned model_idx so a known-exhausted model isn't retried again.
     """
-    try:
-        agency_rows = json.loads(tools_map["run_sql"]("SELECT DISTINCT agency_name FROM agency"))
-        known_agencies = [r["agency_name"] for r in agency_rows] if isinstance(agency_rows, list) else []
-    except Exception:
-        known_agencies = []
+    known_agencies = get_agency_names()
+
+    # Ask for an INDEX into this list rather than a copied string - the model
+    # is reliably good at picking a number, but unreliable at reproducing a
+    # Hebrew string exactly (it kept returning the user's own English spelling,
+    # e.g. "Dan" instead of "דן", which is an exact-match SQL filter and
+    # silently failed). An index can't be mistranslated or misspelled.
+    agency_list_text = "\n".join(f"{i}: {name}" for i, name in enumerate(known_agencies))
 
     system = (
         "Decide whether this question needs information about MORE THAN ONE "
@@ -570,13 +573,14 @@ def _build_plan(question: str, model_idx: int):
         "markdown fences, in exactly this shape:\n"
         '{"subgoals": [{"target": "<line number as a string>", '
         '"goal_type": "<one of: ' + ", ".join(sorted(_PLAN_GOAL_TYPES)) + '>", '
-        '"agency_name": "<the matching name copied EXACTLY from the list below '
-        'if the user mentioned an operator (in any language/spelling), else null>"}], '
+        '"agency_index": <the number from the operator list below if the user '
+        "mentioned an operator for this line, in ANY language/spelling (e.g. "
+        '\'Dan\' or \'of Dan\' means the row for "דן"), else null>}], '
         '"compare": "<short phrase for what to do with the results, e.g. '
         "'which line has more stops' or 'list the stop count for each'>\"}\n"
         "Do not invent goal_types outside that list. Do not add extra keys.\n\n"
-        "Valid agency_name values (copy one of these exactly, do not translate or "
-        "respell it yourself): " + ", ".join(known_agencies)
+        "Operators (pick by number, do not copy or translate the text yourself):\n"
+        + agency_list_text
     )
     def _call(provider, model, client):
         if provider == "anthropic":
@@ -603,10 +607,13 @@ def _build_plan(question: str, model_idx: int):
     if not data:
         return None, model_idx
 
-    subgoals = [
-        s for s in data.get("subgoals", [])
-        if isinstance(s, dict) and s.get("goal_type") in _PLAN_GOAL_TYPES and s.get("target")
-    ]
+    subgoals = []
+    for s in data.get("subgoals", []):
+        if not (isinstance(s, dict) and s.get("goal_type") in _PLAN_GOAL_TYPES and s.get("target")):
+            continue
+        idx = s.get("agency_index")
+        agency_name = known_agencies[idx] if isinstance(idx, int) and 0 <= idx < len(known_agencies) else None
+        subgoals.append({"target": s["target"], "goal_type": s["goal_type"], "agency_name": agency_name})
     if len(subgoals) < 2:
         return None, model_idx
 
@@ -769,14 +776,26 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             plan_state["results"][subgoal["target"]] = value
             plan_state["current_index"] += 1
 
-        # every sub-goal resolved - one small finishing call, then the
-        # existing, unmodified anti-fabrication verify pass
-        summary = "; ".join(f"line {t}: {v}" for t, v in plan_state["results"].items())
-        draft = f"Comparing {plan_state['compare']} - {summary}."
+        # every sub-goal resolved - compute the verdict deterministically
+        # (arithmetic on numbers already fetched, not something the LLM
+        # should be trusted to state on its own) so the draft handed to
+        # _verify_answer already contains the answer, not just raw numbers.
+        # _verify_answer is instructed to add nothing beyond what's already
+        # in the draft - a bare number list would leave "who's bigger"
+        # unanswered, which is exactly what happened before this fix.
+        results = plan_state["results"]
+        numeric = {t: v for t, v in results.items() if isinstance(v, (int, float))}
+        detail = ", ".join(f"line {t} has {v}" for t, v in results.items())
+        if len(numeric) == len(results) and len(numeric) >= 2:
+            winner = max(numeric, key=numeric.get)
+            runner_up = min(numeric, key=numeric.get)
+            draft = f"{detail}. Line {winner} has the highest value; line {runner_up} has the lowest."
+        else:
+            draft = f"Comparing {plan_state['compare']} - {detail}."
         final = _verify_answer(plan_state["original_question"], draft, provider, model, client)
         yield {
             "status": "done",
-            "log": [{"type": "action", "tool": "sequencer", "args": {}, "observation": summary}],
+            "log": [{"type": "action", "tool": "sequencer", "args": {}, "observation": detail}],
             "coords": [], "map_data": None, "chart_data": None, "timetable_data": None,
             "line_context": line_context, "plan_state": None, "answer": final,
         }
