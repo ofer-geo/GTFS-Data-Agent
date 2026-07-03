@@ -678,8 +678,17 @@ def _resolve_current_subgoal(plan_state: dict):
     if data.get("clarification_needed"):
         options = data.get("options", [])
         formatted = "\n".join(f"{o['option_number']}. {o['label']}" for o in options)
-        return ("clarification",
-                f"For line {subgoal['target']}:\n{formatted}\nPlease enter a number.")
+        hebrew = _is_hebrew(plan_state["original_question"])
+        if data["clarification_needed"] == "agency":
+            intro = (f"קו {subgoal['target']} מופעל על ידי יותר ממפעיל אחד — לאיזה מהם התכוונת?" if hebrew
+                      else f"Line {subgoal['target']} is operated by more than one agency — which one did you mean?")
+        else:
+            intro = (f"לקו {subgoal['target']} יש יותר ממסלול אחד — לאיזה מהם התכוונת?" if hebrew
+                      else f"Line {subgoal['target']} has more than one route — which one did you mean?")
+        prompt = "אנא הזן מספר." if hebrew else "Please enter a number."
+        # \n\n (not a single \n) so Markdown breaks out of the numbered list
+        # into a new paragraph, instead of gluing this onto the last item.
+        return ("clarification", f"{intro}\n\n{formatted}\n\n{prompt}")
 
     if not data.get("can_proceed"):
         return ("error", data.get("reason") or f"Couldn't resolve line {subgoal['target']}.")
