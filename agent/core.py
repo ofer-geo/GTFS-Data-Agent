@@ -3,7 +3,10 @@ import time
 import re
 
 from config import MODEL_PRIORITY
-from agent.tools import tools_map, TOOLS_SCHEMA, selection_state, plot_route_map
+from agent.tools import (
+    tools_map, TOOLS_SCHEMA, selection_state, plot_route_map,
+    get_line_variants, get_line_stops, select_option,
+)
 from agent.prompts import SYSTEM_PROMPT
 from agent.utils import get_client
 
@@ -486,7 +489,157 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
         return draft
 
 
-def react_agent(question: str, context: list = None, max_steps: int = 15, stop_event=None, line_context: dict = None):
+# ---------------------------------------------------------------------------
+# Scoped sequencer: an additive, closed-vocabulary planner for questions that
+# compare a metric across multiple lines (e.g. "which has more stops, line 5
+# or line 4?"). Deliberately NOT a general planner: it only ever sequences
+# existing tools for a small, fixed set of goal_types, using zero LLM calls
+# for the mechanical parts (line resolution reuses get_line_variants exactly
+# as the main loop does; picking which tool to call per goal_type is a plain
+# dict dispatch, not a decision). It falls back to the normal single-line
+# loop below whenever it isn't confident, so ordinary single-line questions
+# (the vast majority) are entirely unaffected and pay zero extra cost.
+# ---------------------------------------------------------------------------
+
+_COMPARISON_WORDS = {
+    "more", "less", "fewer", "most", "least", "compare", "vs", "versus", "than",
+    "יותר", "פחות", "לעומת",
+}
+_LINE_TOKEN_RE = re.compile(r"\b(?:line|קו)\s+(\d+)\b", re.IGNORECASE)
+_BARE_NUM_RE = re.compile(r"\b\d{1,4}\b")
+
+_PLAN_GOAL_TYPES = {"count_stops", "get_agency", "get_first_stop", "get_last_stop"}
+
+
+def _looks_compound(question: str) -> bool:
+    """
+    Cheap, deterministic pre-filter - no LLM call. Only fires the (paid)
+    planning call below for questions that mention 2+ line numbers AND a
+    comparison word; everything else takes the normal path unmodified.
+    """
+    q_lower = question.lower()
+    if not any(w in q_lower for w in _COMPARISON_WORDS):
+        return False
+    labeled = set(_LINE_TOKEN_RE.findall(question))
+    if len(labeled) >= 2:
+        return True
+    return len(set(_BARE_NUM_RE.findall(question))) >= 2
+
+
+def _build_plan(question: str, provider: str, model: str, client):
+    """
+    One small, constrained LLM call - same pattern as _verify_answer and
+    _summarize_frequency: its own narrow system prompt, kept separate from
+    the main reasoning call. Output is restricted to a closed goal_type enum
+    mapped directly onto existing tools, so a bad plan can pick a wrong
+    sequence but never invent a new capability. Returns None (falls back to
+    the normal loop) if parsing fails or fewer than 2 usable sub-goals come back.
+    """
+    system = (
+        "Break the user's question into an ordered list of sub-goals, one per "
+        "line number mentioned. Output ONLY compact JSON, no prose, no markdown "
+        "fences, in exactly this shape:\n"
+        '{"subgoals": [{"target": "<line number as a string>", '
+        '"goal_type": "<one of: ' + ", ".join(sorted(_PLAN_GOAL_TYPES)) + '>", '
+        '"agency_name": "<operator name if the user mentioned one, else null>"}], '
+        '"compare": "<short phrase for what to do with the results, e.g. '
+        "'which line has more stops'>\"}\n"
+        "Do not invent goal_types outside that list. Do not add extra keys."
+    )
+    try:
+        if provider == "anthropic":
+            resp = client.messages.create(
+                model=model, max_tokens=400, system=system,
+                messages=[{"role": "user", "content": question}],
+            )
+            text = "".join(b.text for b in resp.content if b.type == "text")
+        else:
+            kwargs = dict(
+                model=model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": question}],
+            )
+            kwargs.update(_reasoning_kwargs(provider, model))
+            resp = client.chat.completions.create(**kwargs)
+            text = resp.choices[0].message.content or ""
+
+        cleaned = text.strip().strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+        data = json.loads(cleaned)
+
+        subgoals = [
+            s for s in data.get("subgoals", [])
+            if isinstance(s, dict) and s.get("goal_type") in _PLAN_GOAL_TYPES and s.get("target")
+        ]
+        if len(subgoals) < 2:
+            return None
+
+        return {
+            "subgoals": subgoals,
+            "results": {},
+            "current_index": 0,
+            "compare": data.get("compare", ""),
+            "original_question": question,
+        }
+    except Exception as e:
+        print(f"[Agent] Plan build failed: {e}")
+        return None
+
+
+def _dispatch_goal(subgoal: dict, resolved: dict):
+    """
+    Deterministic goal_type -> tool dispatch, once a subgoal's line is
+    uniquely resolved (resolved = a can_proceed=true get_line_variants
+    result). No LLM involved - goal_type is a closed enum, so which tool to
+    call is already known, not decided.
+    """
+    selected = resolved.get("selected_line", {})
+    route_ids = selected.get("route_ids", [])
+    goal_type = subgoal["goal_type"]
+
+    if goal_type == "get_agency":
+        return selected.get("agency_name", ""), route_ids
+
+    directions = json.loads(get_line_stops(route_ids))
+    if not isinstance(directions, list) or not directions:
+        return None, route_ids
+    if goal_type == "count_stops":
+        return sum(d.get("stops_count", 0) for d in directions), route_ids
+    if goal_type == "get_first_stop":
+        return directions[0].get("first_stop"), route_ids
+    if goal_type == "get_last_stop":
+        return directions[0].get("last_stop"), route_ids
+    return None, route_ids
+
+
+def _resolve_current_subgoal(plan_state: dict):
+    """
+    Deterministically drives the current sub-goal to completion or to a
+    pending disambiguation - reuses get_line_variants exactly as the main
+    loop does. Returns a tuple:
+      ("done", value, route_ids)
+      ("clarification", message_to_show)
+      ("error", message)
+    """
+    subgoal = plan_state["subgoals"][plan_state["current_index"]]
+    raw = get_line_variants(line_number=subgoal["target"], agency_name=subgoal.get("agency_name"))
+    data = json.loads(raw)
+
+    if data.get("clarification_needed"):
+        options = data.get("options", [])
+        formatted = "\n".join(f"{o['option_number']}. {o['label']}" for o in options)
+        return ("clarification",
+                f"For line {subgoal['target']}:\n{formatted}\nPlease enter a number.")
+
+    if not data.get("can_proceed"):
+        return ("error", data.get("reason") or f"Couldn't resolve line {subgoal['target']}.")
+
+    value, route_ids = _dispatch_goal(subgoal, data)
+    return ("done", value, route_ids)
+
+
+def react_agent(question: str, context: list = None, max_steps: int = 15, stop_event=None,
+                 line_context: dict = None, plan_state: dict = None):
     """
     question: the current user message (string)
     context:  previous conversation turns as [{"role": ..., "content": ...}, ...]
@@ -497,6 +650,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
               conversation. Threaded into get_messages() so the model doesn't
               have to re-derive an already-known line from raw chat text, and
               updated here as the conversation progresses.
+    plan_state: persisted state for the scoped sequencer above - pass None
+              for a fresh conversation, and re-pass whatever was last
+              yielded otherwise. Only engaged for questions _looks_compound()
+              flags; every other question ignores this entirely.
 
     Model selection is automatic: starts at MODEL_PRIORITY[0] and, on a
     rate-limit/quota error, silently advances to the next entry (logged as a
@@ -510,9 +667,74 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
         "line_number": None, "agency": None, "route_ids": [], "directions": None, "given": {},
     }
     line_context.setdefault("given", {})
+    plan_state = dict(plan_state) if plan_state else None
 
     history = list(context or []) + [{"role": "user", "content": question}]
     print(f"[Agent] New query -> provider={provider!r} model={model!r}")
+
+    # --- Scoped sequencer: resume a pending sub-goal, start a new plan, or skip entirely ---
+    if plan_state and selection_state.get("pending_type") in ("agency", "route"):
+        m = re.search(r"\b(\d+)\b", question.strip())
+        if m:
+            sel = json.loads(select_option(int(m.group(1))))
+            if sel.get("can_proceed"):
+                subgoal = plan_state["subgoals"][plan_state["current_index"]]
+                value, _ = _dispatch_goal(subgoal, sel)
+                plan_state["results"][subgoal["target"]] = value
+                plan_state["current_index"] += 1
+            # else: bad/still-ambiguous reply - plan_state untouched, the loop
+            # below will re-surface the same clarification for this sub-goal
+
+    elif plan_state is None and _looks_compound(question):
+        candidate = _build_plan(question, provider, model, client)
+        if candidate:
+            plan_state = candidate
+            print(f"[Agent] Scoped sequencer engaged: {len(candidate['subgoals'])} sub-goal(s)")
+
+    if plan_state:
+        while plan_state["current_index"] < len(plan_state["subgoals"]):
+            outcome = _resolve_current_subgoal(plan_state)
+
+            if outcome[0] == "clarification":
+                yield {
+                    "status": "done",
+                    "log": [{"type": "action", "tool": "get_line_variants",
+                             "args": {"line_number": plan_state["subgoals"][plan_state["current_index"]]["target"]},
+                             "observation": outcome[1]}],
+                    "coords": [], "map_data": None, "chart_data": None, "timetable_data": None,
+                    "line_context": line_context, "plan_state": plan_state, "answer": outcome[1],
+                }
+                return
+
+            if outcome[0] == "error":
+                print(f"[Agent] Sequencer sub-goal failed: {outcome[1]}")
+                yield {
+                    "status": "done",
+                    "log": [{"type": "action", "tool": "sequencer", "args": {}, "observation": outcome[1]}],
+                    "coords": [], "map_data": None, "chart_data": None, "timetable_data": None,
+                    "line_context": line_context, "plan_state": None,
+                    "answer": f"I couldn't complete that comparison: {outcome[1]}",
+                }
+                return
+
+            _, value, _route_ids = outcome
+            subgoal = plan_state["subgoals"][plan_state["current_index"]]
+            plan_state["results"][subgoal["target"]] = value
+            plan_state["current_index"] += 1
+
+        # every sub-goal resolved - one small finishing call, then the
+        # existing, unmodified anti-fabrication verify pass
+        summary = "; ".join(f"line {t}: {v}" for t, v in plan_state["results"].items())
+        draft = f"Comparing {plan_state['compare']} - {summary}."
+        final = _verify_answer(plan_state["original_question"], draft, provider, model, client)
+        yield {
+            "status": "done",
+            "log": [{"type": "action", "tool": "sequencer", "args": {}, "observation": summary}],
+            "coords": [], "map_data": None, "chart_data": None, "timetable_data": None,
+            "line_context": line_context, "plan_state": None, "answer": final,
+        }
+        return
+
     messages = get_messages(history, provider, line_context=line_context)
 
     # If nothing in this conversation has named timetable/frequency yet, the model
