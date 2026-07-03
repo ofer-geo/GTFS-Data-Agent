@@ -1207,7 +1207,19 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             coords += extract_coords(result)
             yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": None}
 
-            trimmed = result if len(result) <= MAX_OBS_CHARS else result[:MAX_OBS_CHARS] + "\n...[truncated]"
+            # get_line_stops is exempt from the generic cap: the WORKFLOW
+            # requires the model to faithfully restate every stop, so
+            # truncating it doesn't just lose detail - it silently invites
+            # fabrication (verified: a 57-stop line's real JSON is ~13,000
+            # chars, over 6x MAX_OBS_CHARS; the model correctly echoed the
+            # first ~15 real stops, then invented the rest to match the
+            # stops_count it could still see, including outright fake
+            # entries). Other tools stay capped - their answers are either
+            # already bounded (run_sql, disambiguation lists) or explicitly
+            # NOT meant to be restated verbatim (timetable/schedule data is
+            # rendered separately; the model only writes a short summary).
+            obs_limit = 40000 if func_name == "get_line_stops" else MAX_OBS_CHARS
+            trimmed = result if len(result) <= obs_limit else result[:obs_limit] + "\n...[truncated]"
             _append_tool_result(messages, tool_call.id, func_name, trimmed, provider, current_response)
 
             if stop_after_tool or can_proceed:
