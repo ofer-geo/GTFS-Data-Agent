@@ -793,6 +793,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
         else:
             draft = f"Comparing {plan_state['compare']} - {detail}."
         final = _verify_answer(plan_state["original_question"], draft, provider, model, client)
+        # Mark the conversation as grounded (see already_grounded below) so a
+        # short follow-up like "so which one has more?" doesn't force a fresh
+        # tool call - the answer, including the explicit verdict above, is
+        # already sitting in the chat transcript for the model to read.
+        line_context.setdefault("given", {})["comparison_done"] = True
         yield {
             "status": "done",
             "log": [{"type": "action", "tool": "sequencer", "args": {}, "observation": detail}],
@@ -1026,6 +1031,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 bool(line_context.get("route_ids"))
                 or data_tool_used
                 or selection_state.get("pending_type") is not None
+                or line_context.get("given", {}).get("comparison_done")
             )
             if tool_calls_made == 0 and not already_grounded:
                 # Only force a tool call if NOTHING in this conversation has
