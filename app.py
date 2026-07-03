@@ -170,6 +170,7 @@ for key, default in {
     "agent_answer": None,
     "stop_event": None,
     "line_context": None,
+    "plan_state": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -263,11 +264,12 @@ def render_route_map(map_data: dict):
         st.error(f"Map render error: {e}")
 
 
-def _agent_thread(question, context, result_queue, stop_event, line_context):
+def _agent_thread(question, context, result_queue, stop_event, line_context, plan_state):
     from agent.core import react_agent
     log = []
     try:
-        for update in react_agent(question, context=context, stop_event=stop_event, line_context=line_context):
+        for update in react_agent(question, context=context, stop_event=stop_event,
+                                   line_context=line_context, plan_state=plan_state):
             log = update.get("log", log)
             result_queue.put(update)
     except Exception as e:
@@ -302,6 +304,7 @@ with st.sidebar:
         st.session_state["chat_history"] = []
         st.session_state["agent_map_data"] = None
         st.session_state["line_context"] = None
+        st.session_state["plan_state"] = None
         st.rerun()
 
 
@@ -441,6 +444,8 @@ with col_chat:
                     st.session_state.agent_timetable_data = update["timetable_data"]
                 if update.get("line_context"):
                     st.session_state.line_context = update["line_context"]
+                if "plan_state" in update:
+                    st.session_state.plan_state = update["plan_state"]
                 if update.get("answer"):
                     st.session_state.agent_answer = update["answer"]
 
@@ -516,7 +521,8 @@ with col_chat:
             t = threading.Thread(
                 target=_agent_thread,
                 args=(question, context, st.session_state.agent_queue,
-                      st.session_state.stop_event, st.session_state.line_context),
+                      st.session_state.stop_event, st.session_state.line_context,
+                      st.session_state.plan_state),
                 daemon=True,
             )
             t.start()
