@@ -43,6 +43,23 @@ def get_schema() -> str:
         return f"Error: {e}"
 
 
+def get_agency_names() -> list:
+    """
+    All distinct agency names, uncapped - for internal (non-LLM-facing) use
+    only. run_sql() is deliberately capped at MAX_ROWS for LLM output size,
+    which silently truncates this list (36 agencies > 30-row cap); this
+    bypasses that cap since callers here need the complete list.
+    """
+    if _conn is None:
+        return []
+    try:
+        return [row[0] for row in _conn.execute(
+            "SELECT DISTINCT agency_name FROM agency ORDER BY agency_name"
+        ).fetchall()]
+    except Exception:
+        return []
+
+
 def get_line_variants(line_number: str, agency_name: str = None, _internal: bool = False) -> str:
     """
     Return route variants for a given line number.
