@@ -491,60 +491,58 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
 
 # ---------------------------------------------------------------------------
 # Scoped sequencer: an additive, closed-vocabulary planner for questions that
-# compare a metric across multiple lines (e.g. "which has more stops, line 5
-# or line 4?"). Deliberately NOT a general planner: it only ever sequences
-# existing tools for a small, fixed set of goal_types, using zero LLM calls
-# for the mechanical parts (line resolution reuses get_line_variants exactly
-# as the main loop does; picking which tool to call per goal_type is a plain
-# dict dispatch, not a decision). It falls back to the normal single-line
-# loop below whenever it isn't confident, so ordinary single-line questions
-# (the vast majority) are entirely unaffected and pay zero extra cost.
+# need a metric resolved across multiple lines (e.g. "which has more stops,
+# line 5 or line 4?", "how many stops have lines 125 and 25?"). Deliberately
+# NOT a general planner: it only ever sequences existing tools for a small,
+# fixed set of goal_types, using zero LLM calls for the mechanical parts
+# (line resolution reuses get_line_variants exactly as the main loop does;
+# picking which tool to call per goal_type is a plain dict dispatch, not a
+# decision). Whether a question needs this at all is also decided by the
+# same LLM call that builds the plan - not a keyword/regex pre-filter, since
+# that proved too brittle (missed plural "lines", missed phrasings with no
+# explicit comparison word like "more"/"less"). If it decides no plan is
+# needed, execution falls through to the exact same single-line loop below,
+# unchanged.
 # ---------------------------------------------------------------------------
-
-_COMPARISON_WORDS = {
-    "more", "less", "fewer", "most", "least", "compare", "vs", "versus", "than",
-    "יותר", "פחות", "לעומת",
-}
-_LINE_TOKEN_RE = re.compile(r"\b(?:line|קו)\s+(\d+)\b", re.IGNORECASE)
-_BARE_NUM_RE = re.compile(r"\b\d{1,4}\b")
 
 _PLAN_GOAL_TYPES = {"count_stops", "get_agency", "get_first_stop", "get_last_stop"}
 
 
-def _looks_compound(question: str) -> bool:
-    """
-    Cheap, deterministic pre-filter - no LLM call. Only fires the (paid)
-    planning call below for questions that mention 2+ line numbers AND a
-    comparison word; everything else takes the normal path unmodified.
-    """
-    q_lower = question.lower()
-    if not any(w in q_lower for w in _COMPARISON_WORDS):
-        return False
-    labeled = set(_LINE_TOKEN_RE.findall(question))
-    if len(labeled) >= 2:
-        return True
-    return len(set(_BARE_NUM_RE.findall(question))) >= 2
-
-
 def _build_plan(question: str, provider: str, model: str, client):
     """
-    One small, constrained LLM call - same pattern as _verify_answer and
+    One small LLM call - same pattern as _verify_answer and
     _summarize_frequency: its own narrow system prompt, kept separate from
-    the main reasoning call. Output is restricted to a closed goal_type enum
-    mapped directly onto existing tools, so a bad plan can pick a wrong
-    sequence but never invent a new capability. Returns None (falls back to
-    the normal loop) if parsing fails or fewer than 2 usable sub-goals come back.
+    the main reasoning call. Decides BOTH whether this question needs
+    multiple lines resolved, and if so, breaks it into sub-goals from a
+    closed goal_type enum mapped directly onto existing tools - so it can
+    misjudge which lines are involved, but can never invent a new tool or
+    approach. Returns None whenever a single-line answer is more appropriate
+    (including on any parse/API failure) - the normal loop handles those.
     """
+    try:
+        agency_rows = json.loads(tools_map["run_sql"]("SELECT DISTINCT agency_name FROM agency"))
+        known_agencies = [r["agency_name"] for r in agency_rows] if isinstance(agency_rows, list) else []
+    except Exception:
+        known_agencies = []
+
     system = (
-        "Break the user's question into an ordered list of sub-goals, one per "
-        "line number mentioned. Output ONLY compact JSON, no prose, no markdown "
-        "fences, in exactly this shape:\n"
+        "Decide whether this question needs information about MORE THAN ONE "
+        "public transport line to answer (e.g. comparing two lines, or asking "
+        "for a fact about each of several lines). Most questions are about a "
+        "single line - only treat it as multi-line if the question genuinely "
+        "names 2 or more distinct line numbers that each need to be looked up.\n\n"
+        "If it's a single-line question, output exactly: {\"subgoals\": []}\n\n"
+        "If it's genuinely multi-line, output ONLY compact JSON, no prose, no "
+        "markdown fences, in exactly this shape:\n"
         '{"subgoals": [{"target": "<line number as a string>", '
         '"goal_type": "<one of: ' + ", ".join(sorted(_PLAN_GOAL_TYPES)) + '>", '
-        '"agency_name": "<operator name if the user mentioned one, else null>"}], '
+        '"agency_name": "<the matching name copied EXACTLY from the list below '
+        'if the user mentioned an operator (in any language/spelling), else null>"}], '
         '"compare": "<short phrase for what to do with the results, e.g. '
-        "'which line has more stops'>\"}\n"
-        "Do not invent goal_types outside that list. Do not add extra keys."
+        "'which line has more stops' or 'list the stop count for each'>\"}\n"
+        "Do not invent goal_types outside that list. Do not add extra keys.\n\n"
+        "Valid agency_name values (copy one of these exactly, do not translate or "
+        "respell it yourself): " + ", ".join(known_agencies)
     )
     try:
         if provider == "anthropic":
@@ -622,8 +620,18 @@ def _resolve_current_subgoal(plan_state: dict):
       ("error", message)
     """
     subgoal = plan_state["subgoals"][plan_state["current_index"]]
-    raw = get_line_variants(line_number=subgoal["target"], agency_name=subgoal.get("agency_name"))
+    agency_guess = subgoal.get("agency_name")
+    raw = get_line_variants(line_number=subgoal["target"], agency_name=agency_guess)
     data = json.loads(raw)
+
+    # A wrong/mismatched agency guess (e.g. the planner copying the user's
+    # own English spelling instead of the DB's Hebrew name) makes the exact
+    # SQL match come back empty rather than ambiguous - that's a dead end,
+    # not a real "line not found". Retry once without the guess so the user
+    # gets a normal agency disambiguation instead of a false error.
+    if agency_guess and not data.get("can_proceed") and not data.get("clarification_needed"):
+        raw = get_line_variants(line_number=subgoal["target"], agency_name=None)
+        data = json.loads(raw)
 
     if data.get("clarification_needed"):
         options = data.get("options", [])
@@ -652,8 +660,8 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
               updated here as the conversation progresses.
     plan_state: persisted state for the scoped sequencer above - pass None
               for a fresh conversation, and re-pass whatever was last
-              yielded otherwise. Only engaged for questions _looks_compound()
-              flags; every other question ignores this entirely.
+              yielded otherwise. _build_plan() decides per-question whether
+              it's needed; single-line questions fall through unaffected.
 
     Model selection is automatic: starts at MODEL_PRIORITY[0] and, on a
     rate-limit/quota error, silently advances to the next entry (logged as a
@@ -685,7 +693,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             # else: bad/still-ambiguous reply - plan_state untouched, the loop
             # below will re-surface the same clarification for this sub-goal
 
-    elif plan_state is None and _looks_compound(question):
+    elif plan_state is None:
         candidate = _build_plan(question, provider, model, client)
         if candidate:
             plan_state = candidate
