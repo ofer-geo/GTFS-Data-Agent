@@ -519,6 +519,101 @@ def plot_route_map(route_ids: list, line_num: str = None, agency: str = None) ->
         return f"Error: {e}"
 
 
+def plot_multi_line_map(lines: list) -> str:
+    """
+    Interactive map comparing 2+ different lines at once, each LINE its own
+    color (not per-direction like plot_route_map - showing every direction
+    of every line in a distinct color would be too many colors to read at a
+    glance for a comparison). A dropdown isolates one line, or shows all.
+    Same chart_type/figure_json shape as plot_route_map, so app.py and
+    extract_map_data() handle it identically.
+
+    Built for the scoped sequencer's comparison answers (agent/core.py) -
+    not exposed to the LLM as a callable tool.
+
+    lines: [{"route_ids": [...], "line_num": "...", "agency": "..." or None}, ...]
+    """
+    try:
+        fig = go.Figure()
+        trace_for_line = {}
+        all_lats, all_lons = [], []
+
+        def label_for(line):
+            label = f"Line {line.get('line_num', '?')}"
+            if line.get("agency"):
+                label += f" ({line['agency']})"
+            return label
+
+        for i, line in enumerate(lines):
+            directions = json.loads(get_line_stops(line["route_ids"]))
+            if not isinstance(directions, list) or not directions:
+                continue
+            color = _MAP_COLORS[i % len(_MAP_COLORS)]
+            lats, lons, seqs, hover = [], [], [], []
+            for direction in directions:
+                for s in direction["stops"]:
+                    lats.append(s["lat"])
+                    lons.append(s["lon"])
+                    seqs.append(str(s["sequence"]))
+                    hover.append(f"{s['stop_name']} — {s['stop_code']}")
+            if not lats:
+                continue
+            all_lats += lats
+            all_lons += lons
+            fig.add_trace(go.Scattermapbox(
+                lat=lats, lon=lons, mode="markers+text",
+                marker=dict(size=16, color=color),
+                text=seqs, textfont=dict(size=9, color="white"),
+                hovertext=hover, hoverinfo="text",
+                name=label_for(line), showlegend=True,
+            ))
+            trace_for_line[i] = len(fig.data) - 1
+
+        if not trace_for_line:
+            return json.dumps({"error": "No stop data found for the given lines."}, ensure_ascii=False)
+
+        total_traces = len(fig.data)
+
+        def visible_for(selected):
+            visible = [False] * total_traces
+            for idx in selected:
+                visible[trace_for_line[idx]] = True
+            return visible
+
+        buttons = [dict(
+            label="All lines", method="update",
+            args=[{"visible": visible_for(list(trace_for_line.keys()))}],
+        )]
+        for i, line in enumerate(lines):
+            if i in trace_for_line:
+                buttons.append(dict(
+                    label=label_for(line), method="update",
+                    args=[{"visible": visible_for([i])}],
+                ))
+
+        mid_lat = sum(all_lats) / len(all_lats)
+        mid_lon = sum(all_lons) / len(all_lons)
+        zoom = fit_bounds_zoom(min(all_lats), max(all_lats), min(all_lons), max(all_lons), padding=0.25)
+
+        title_text = "Route comparison — " + ", ".join(label_for(l) for l in lines)
+
+        fig.update_layout(
+            title=dict(text=title_text, y=0.99, yanchor="top"),
+            mapbox=dict(style=MAP_STYLE, center=dict(lat=mid_lat, lon=mid_lon), zoom=zoom),
+            margin=dict(l=0, r=0, t=80, b=0),
+            height=MAP_HEIGHT,
+            updatemenus=[dict(
+                buttons=buttons, direction="down", x=0, y=0.99,
+                xanchor="left", yanchor="top", showactive=True,
+                pad=dict(t=25),
+            )],
+            legend=dict(title="Line", x=0, y=0),
+        )
+        return json.dumps({"chart_type": "route_map", "figure_json": fig.to_json()}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
 _VALID_DAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
 _DAY_COLS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
