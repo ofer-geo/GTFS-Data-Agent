@@ -793,6 +793,29 @@ def plot_departure_schedule(route_ids: list, specific_day: str = None) -> str:
         return f"Error: {e}"
 
 
+def plot_comparison_chart(results: dict, title: str = "") -> str:
+    """
+    Small bar chart comparing a numeric metric across 2+ lines - built for
+    the scoped sequencer's comparison answers (agent/core.py). Same
+    chart_type/figure_json shape as plot_route_map/plot_departure_schedule,
+    so app.py renders it identically. Not exposed to the LLM as a tool -
+    core.py calls this directly once every sub-goal in a comparison resolves
+    to a number.
+    """
+    try:
+        fig = go.Figure(go.Bar(x=[str(k) for k in results], y=list(results.values())))
+        fig.update_layout(
+            title=title or "Comparison",
+            height=340,
+            xaxis_title="Line",
+            yaxis_title="Value",
+            margin=dict(l=55, r=30, t=60, b=40),
+        )
+        return json.dumps({"chart_type": "sequencer_comparison", "figure_json": fig.to_json()}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
 def run_sql(query: str) -> str:
     if _conn is None:
         return "Error: GTFS database not loaded yet."
