@@ -515,21 +515,24 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
 
 
 def _stop_counts_from_tool_results(turn_tool_results: list) -> list:
-    """[(label, count), ...] from this turn's get_line_stops call(s) in the
-    main loop's raw (func_name, json_str) list - ground truth for
-    _verify_stop_counts."""
+    """[(label, count), ...] from this turn's get_line_stops-shaped result(s)
+    in the main loop's raw (func_name, json_str) list - ground truth for
+    _verify_stop_counts. Detected by shape (a list of dicts with
+    stops_count), not by func_name, so it doesn't matter whether
+    get_line_stops was called directly or dispatched via select_option
+    (direction selection) - any caller returning this same data is covered
+    without needing its name added here by hand."""
     counts = []
-    for func_name, result in turn_tool_results:
-        if func_name != "get_line_stops":
-            continue
+    for _func_name, result in turn_tool_results:
         try:
             directions = json.loads(result)
         except (json.JSONDecodeError, TypeError):
             continue
-        if isinstance(directions, list):
-            for d in directions:
-                if isinstance(d, dict) and isinstance(d.get("stops_count"), int):
-                    counts.append((d.get("headsign", "?"), d["stops_count"]))
+        if not isinstance(directions, list):
+            continue
+        for d in directions:
+            if isinstance(d, dict) and isinstance(d.get("stops_count"), int):
+                counts.append((d.get("headsign", "?"), d["stops_count"]))
     return counts
 
 
@@ -1396,7 +1399,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 pass
 
             if func_name in ("get_line_stops", "run_sql", "get_departure_timetable",
-                              "get_departure_schedule", "plot_departure_schedule"):
+                              "get_departure_schedule", "plot_departure_schedule", "select_option"):
+                # select_option is included because it can now dispatch straight
+                # to get_line_stops (direction selection) - it's a real data
+                # answer too, not just a disambiguation step.
                 # Some real data tool answered the question - the schedule-type
                 # guard below should only fire when NOTHING has answered it yet.
                 data_tool_used = True
@@ -1430,7 +1436,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                         {"headsign": d.get("headsign"), "route_id": d.get("route_id")}
                         for d in result_obj["directions"]
                     ]
-                elif func_name == "get_line_stops" and isinstance(result_obj, list):
+                elif func_name in ("get_line_stops", "select_option") and isinstance(result_obj, list):
                     line_context["given"]["stops"] = True
                     if not line_context.get("directions"):
                         line_context["directions"] = [
@@ -1448,18 +1454,26 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             coords += extract_coords(result)
             yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": None}
 
-            # get_line_stops and get_departure_timetable are exempt from the
-            # generic cap: both can genuinely exceed it for a busy/long line
-            # (verified: 57-stop line -> ~13,000 char stop list; busiest
-            # route's Sunday timetable -> ~9,900 chars - both well past
-            # MAX_OBS_CHARS=2000), and a follow-up question can reasonably
-            # ask about a specific stop/departure from that same data later
-            # in the conversation. Truncating either doesn't just lose
-            # detail - it silently invites fabrication: verified once
-            # already for get_line_stops, where the model correctly echoed
-            # the first ~15 real stops, then invented the rest (including
-            # outright fake entries) to match the stops_count it could
-            # still see in the truncated JSON.
+            # A get_line_stops-shaped result (a list of per-direction dicts
+            # with stops_count) is exempt from the generic cap regardless of
+            # which tool produced it - get_line_stops directly, or
+            # select_option dispatching a direction choice to it. Checking
+            # the shape instead of naming both callers means any future
+            # dispatcher that ends up returning this same data is
+            # automatically covered too, instead of needing its name added
+            # to a list by hand. get_departure_timetable gets the same
+            # generous limit for the analogous reason. Both can genuinely
+            # exceed the generic cap for a busy/long line (verified: 57-stop
+            # line -> ~13,000 char stop list; busiest route's Sunday
+            # timetable -> ~9,900 chars - both well past MAX_OBS_CHARS=2000),
+            # and a follow-up question can reasonably ask about a specific
+            # stop/departure from that same data later in the conversation.
+            # Truncating either doesn't just lose detail - it silently
+            # invites fabrication: verified once already for get_line_stops,
+            # where the model correctly echoed the first ~15 real stops,
+            # then invented the rest (including outright fake entries) to
+            # match the stops_count it could still see in the truncated
+            # JSON.
             #
             # plot_departure_schedule's result is replaced outright, not
             # just capped - the model is explicitly told to give a short
@@ -1467,10 +1481,13 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             # needs this JSON (~11,000 chars for a busy route) at all; the
             # UI already extracted chart_data from the untruncated `result`
             # above, so this only affects what the model itself sees.
+            is_stop_list = isinstance(result_obj, list) and result_obj and all(
+                isinstance(d, dict) and "stops_count" in d for d in result_obj
+            )
             if func_name == "plot_departure_schedule":
                 trimmed = "Chart generated and sent to the UI."
             else:
-                obs_limit = 40000 if func_name in ("get_line_stops", "get_departure_timetable") else MAX_OBS_CHARS
+                obs_limit = 40000 if (is_stop_list or func_name == "get_departure_timetable") else MAX_OBS_CHARS
                 trimmed = result if len(result) <= obs_limit else result[:obs_limit] + "\n...[truncated]"
             _append_tool_result(messages, tool_call.id, func_name, trimmed, provider, current_response)
 

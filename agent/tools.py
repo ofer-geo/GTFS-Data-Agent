@@ -247,6 +247,27 @@ def select_option(option_number: int) -> str:
             "reason": "Route option selected. The agent can proceed.",
         }, ensure_ascii=False)
 
+    if pending_type == "direction":
+        # get_line_directions sets this pending state but nothing ever
+        # resolved it - the model was expected to remember, across a full
+        # conversation turn, to call get_line_stops itself with the right
+        # route_id. On at least one real run it didn't: it saw "1" and
+        # fabricated a plausible-looking stop list instead of calling any
+        # tool at all. Resolving the number here, the same way agency/route
+        # already do, means a real get_line_stops call is guaranteed no
+        # matter what the model does with the number - not dependent on it
+        # remembering the earlier direction list.
+        directions = selection_state.get("directions", [])
+        all_route_ids = selection_state.get("all_route_ids", [])
+        if option_number == len(directions) + 1:
+            route_ids = all_route_ids  # "all directions" option
+        elif idx < 0 or idx >= len(directions):
+            return json.dumps({"error": f"Invalid option {option_number}. Valid range: 1–{len(directions) + 1}"})
+        else:
+            route_ids = [directions[idx]["route_id"]]
+        selection_state.update({"pending_type": None, "directions": [], "all_route_ids": []})
+        return get_line_stops(route_ids)
+
     return json.dumps({"error": "No pending selection. Ask the user a question first."})
 
 
