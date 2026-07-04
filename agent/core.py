@@ -644,6 +644,14 @@ def _dispatch_goal(subgoal: dict, resolved: dict):
     uniquely resolved (resolved = a can_proceed=true get_line_variants
     result). No LLM involved - goal_type is a closed enum, so which tool to
     call is already known, not decided.
+
+    For goal_types that vary by direction (count_stops, get_first_stop,
+    get_last_stop), the value is a per-direction dict {headsign: value}
+    rather than a single number - a line's two directions can have
+    different stop counts, and silently summing (or picking direction 0
+    arbitrarily) produced a misleading answer (verified: "114 stops" was
+    actually 57+57 across two separate directions, not one meaningful
+    total). get_agency isn't direction-dependent, so it stays a single value.
     """
     selected = resolved.get("selected_line", {})
     route_ids = selected.get("route_ids", [])
@@ -656,11 +664,11 @@ def _dispatch_goal(subgoal: dict, resolved: dict):
     if not isinstance(directions, list) or not directions:
         return None, route_ids
     if goal_type == "count_stops":
-        return sum(d.get("stops_count", 0) for d in directions), route_ids
+        return {d.get("headsign", "?"): d.get("stops_count", 0) for d in directions}, route_ids
     if goal_type == "get_first_stop":
-        return directions[0].get("first_stop"), route_ids
+        return {d.get("headsign", "?"): d.get("first_stop") for d in directions}, route_ids
     if goal_type == "get_last_stop":
-        return directions[0].get("last_stop"), route_ids
+        return {d.get("headsign", "?"): d.get("last_stop") for d in directions}, route_ids
     return None, route_ids
 
 
@@ -772,14 +780,33 @@ def _finish_sequencer(plan_state: dict, line_context: dict, provider: str, model
     """
     results = plan_state["results"]
     hebrew = _is_hebrew(plan_state["original_question"])
-    numeric = {t: v for t, v in results.items() if isinstance(v, (int, float))}
-    detail = ", ".join(f"line {t} has {v}" for t, v in results.items())
+
+    # Per-direction results (count_stops/get_first_stop/get_last_stop) are
+    # reported in full in the text - never silently summed or collapsed to
+    # one direction - but ranking/charting still needs one representative
+    # number per line, so numeric per-direction values use the higher of
+    # the two directions.
+    numeric = {}
+    detail_parts = []
+    for target, value in results.items():
+        if isinstance(value, dict):
+            per_direction = ", ".join(f"{headsign}: {v}" for headsign, v in value.items())
+            detail_parts.append(f"line {target} ({per_direction})")
+            direction_values = [v for v in value.values() if isinstance(v, (int, float))]
+            if direction_values and len(direction_values) == len(value):
+                numeric[target] = max(direction_values)
+        else:
+            detail_parts.append(f"line {target} has {value}")
+            if isinstance(value, (int, float)):
+                numeric[target] = value
+    detail = "; ".join(detail_parts)
 
     chart_data, map_data, winner = None, None, None
     if len(numeric) == len(results) and len(numeric) >= 2:
         winner = max(numeric, key=numeric.get)
         runner_up = min(numeric, key=numeric.get)
-        draft = f"{detail}. Line {winner} has the highest value; line {runner_up} has the lowest."
+        draft = (f"{detail}. Line {winner} has the highest value (using its higher-count direction); "
+                 f"line {runner_up} has the lowest.")
 
         try:
             cd = json.loads(plot_comparison_chart(numeric, title=plan_state.get("compare", "")))
