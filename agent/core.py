@@ -6,6 +6,7 @@ from config import MODEL_PRIORITY
 from agent.tools import (
     tools_map, TOOLS_SCHEMA, selection_state, plot_route_map,
     get_line_variants, get_line_stops, select_option, get_agency_names,
+    plot_comparison_chart,
 )
 from agent.prompts import SYSTEM_PROMPT
 from agent.utils import get_client
@@ -358,6 +359,17 @@ def _is_hebrew(text: str) -> bool:
     return bool(re.search(r"[֐-׿]", text))
 
 
+def _with_closing_question(answer: str, hebrew: bool) -> str:
+    """
+    Appended to every genuinely finished answer (not a clarifying question,
+    not an error) so a conversation never just stops - the user always gets
+    an explicit invitation to confirm or continue.
+    """
+    closing = ("האם זו התשובה שחיפשת? יש עוד משהו שאוכל לעזור בו?" if hebrew
+               else "Is this what you were looking for? Anything else I can help with?")
+    return f"{answer}\n\n{closing}"
+
+
 def _schedule_type_question(history: list) -> str:
     """Deterministic, code-built timetable-vs-frequency question, in the user's language."""
     last_user_msg = next(
@@ -708,6 +720,129 @@ def _resolve_current_subgoal(plan_state: dict):
     return ("done", value, route_ids)
 
 
+def _apply_subgoal_result(plan_state: dict, value, route_ids: list) -> None:
+    """Store one resolved sub-goal's result and route_ids, then advance the cursor."""
+    subgoal = plan_state["subgoals"][plan_state["current_index"]]
+    plan_state["results"][subgoal["target"]] = value
+    plan_state.setdefault("route_ids", {})[subgoal["target"]] = route_ids
+    plan_state["current_index"] += 1
+
+
+def _sequencer_update(line_context: dict, plan_state, answer: str, chart_data=None, map_data=None) -> dict:
+    """Shared yield-dict shape for every sequencer outcome (clarification, error, or finished)."""
+    return {
+        "status": "done",
+        "log": [{"type": "action", "tool": "sequencer", "args": {}, "observation": answer[:500]}],
+        "coords": [], "map_data": map_data, "chart_data": chart_data, "timetable_data": None,
+        "line_context": line_context, "plan_state": plan_state, "answer": answer,
+    }
+
+
+def _finish_sequencer(plan_state: dict, line_context: dict, provider: str, model: str, client) -> dict:
+    """
+    Every sub-goal is resolved - compute the verdict deterministically
+    (arithmetic on numbers already fetched, not something the LLM should be
+    trusted to state on its own) so the draft handed to _verify_answer
+    already contains the answer, not just raw numbers - _verify_answer is
+    forbidden from adding a fact that isn't already in the draft. Also
+    builds a comparison chart and the winning line's route map, so the
+    conversation ends with something to look at, not just text, and marks
+    line_context as grounded so a short follow-up doesn't force a fresh,
+    redundant tool call.
+    """
+    results = plan_state["results"]
+    hebrew = _is_hebrew(plan_state["original_question"])
+    numeric = {t: v for t, v in results.items() if isinstance(v, (int, float))}
+    detail = ", ".join(f"line {t} has {v}" for t, v in results.items())
+
+    chart_data, map_data, winner = None, None, None
+    if len(numeric) == len(results) and len(numeric) >= 2:
+        winner = max(numeric, key=numeric.get)
+        runner_up = min(numeric, key=numeric.get)
+        draft = f"{detail}. Line {winner} has the highest value; line {runner_up} has the lowest."
+
+        try:
+            cd = json.loads(plot_comparison_chart(numeric, title=plan_state.get("compare", "")))
+            if isinstance(cd, dict) and "chart_type" in cd:
+                chart_data = cd
+        except Exception as e:
+            print(f"[Agent] Sequencer comparison chart failed: {e}")
+
+        winner_route_ids = plan_state.get("route_ids", {}).get(winner)
+        if winner_route_ids:
+            try:
+                map_data = extract_map_data(plot_route_map(winner_route_ids, line_num=winner))
+            except Exception as e:
+                print(f"[Agent] Sequencer route map failed: {e}")
+    else:
+        draft = f"Comparing {plan_state.get('compare', '')} - {detail}."
+
+    final = _verify_answer(plan_state["original_question"], draft, provider, model, client)
+    if chart_data and map_data:
+        final += (f" הצגתי גם תרשים השוואה ואת מפת המסלול של קו {winner}." if hebrew
+                  else f" I've also shown a comparison chart and the route map for line {winner}.")
+    elif chart_data:
+        final += " הצגתי גם תרשים השוואה." if hebrew else " I've also shown a comparison chart."
+    elif map_data:
+        final += (f" הצגתי גם את מפת המסלול של קו {winner}." if hebrew
+                  else f" I've also shown the route map for line {winner}.")
+    final = _with_closing_question(final, hebrew)
+
+    line_context.setdefault("given", {})["comparison_done"] = True
+    return _sequencer_update(line_context, None, final, chart_data=chart_data, map_data=map_data)
+
+
+def _run_sequencer_turn(question: str, plan_state: dict, line_context: dict, model_idx: int):
+    """
+    Handles one turn of the scoped sequencer end to end: resuming a pending
+    sub-goal, starting a new plan, or resolving through to a finished
+    comparison. Returns (update, new_model_idx) where update is a
+    ready-to-yield dict if the sequencer fully handled this turn, or
+    (None, new_model_idx) if it has nothing to do and the normal
+    single-line loop below should run instead.
+    """
+    provider, model = MODEL_PRIORITY[model_idx]
+    client = get_client(provider)
+
+    if plan_state and selection_state.get("pending_type") in ("agency", "route"):
+        m = re.search(r"\b(\d+)\b", question.strip())
+        if m:
+            sel = json.loads(select_option(int(m.group(1))))
+            if sel.get("can_proceed"):
+                value, route_ids = _dispatch_goal(plan_state["subgoals"][plan_state["current_index"]], sel)
+                _apply_subgoal_result(plan_state, value, route_ids)
+            # else: bad/still-ambiguous reply - plan_state untouched, the
+            # while loop below re-surfaces the same clarification
+
+    elif plan_state is None:
+        candidate, model_idx = _build_plan(question, model_idx)
+        provider, model = MODEL_PRIORITY[model_idx]
+        client = get_client(provider)
+        if candidate:
+            plan_state = candidate
+            print(f"[Agent] Scoped sequencer engaged: {len(candidate['subgoals'])} sub-goal(s), "
+                  f"using {provider}/{model}")
+
+    if not plan_state:
+        return None, model_idx
+
+    while plan_state["current_index"] < len(plan_state["subgoals"]):
+        outcome = _resolve_current_subgoal(plan_state)
+
+        if outcome[0] == "clarification":
+            return _sequencer_update(line_context, plan_state, outcome[1]), model_idx
+
+        if outcome[0] == "error":
+            print(f"[Agent] Sequencer sub-goal failed: {outcome[1]}")
+            answer = f"I couldn't complete that comparison: {outcome[1]}"
+            return _sequencer_update(line_context, None, answer), model_idx
+
+        _, value, route_ids = outcome
+        _apply_subgoal_result(plan_state, value, route_ids)
+
+    return _finish_sequencer(plan_state, line_context, provider, model, client), model_idx
+
+
 def react_agent(question: str, context: list = None, max_steps: int = 15, stop_event=None,
                  line_context: dict = None, plan_state: dict = None):
     """
@@ -742,89 +877,14 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
     history = list(context or []) + [{"role": "user", "content": question}]
     print(f"[Agent] New query -> provider={provider!r} model={model!r}")
 
-    # --- Scoped sequencer: resume a pending sub-goal, start a new plan, or skip entirely ---
-    if plan_state and selection_state.get("pending_type") in ("agency", "route"):
-        m = re.search(r"\b(\d+)\b", question.strip())
-        if m:
-            sel = json.loads(select_option(int(m.group(1))))
-            if sel.get("can_proceed"):
-                subgoal = plan_state["subgoals"][plan_state["current_index"]]
-                value, _ = _dispatch_goal(subgoal, sel)
-                plan_state["results"][subgoal["target"]] = value
-                plan_state["current_index"] += 1
-            # else: bad/still-ambiguous reply - plan_state untouched, the loop
-            # below will re-surface the same clarification for this sub-goal
-
-    elif plan_state is None:
-        candidate, model_idx = _build_plan(question, model_idx)
-        if model_idx < len(MODEL_PRIORITY):
-            provider, model = MODEL_PRIORITY[model_idx]
-            client = get_client(provider)
-        if candidate:
-            plan_state = candidate
-            print(f"[Agent] Scoped sequencer engaged: {len(candidate['subgoals'])} sub-goal(s), "
-                  f"using {provider}/{model}")
-
-    if plan_state:
-        while plan_state["current_index"] < len(plan_state["subgoals"]):
-            outcome = _resolve_current_subgoal(plan_state)
-
-            if outcome[0] == "clarification":
-                yield {
-                    "status": "done",
-                    "log": [{"type": "action", "tool": "get_line_variants",
-                             "args": {"line_number": plan_state["subgoals"][plan_state["current_index"]]["target"]},
-                             "observation": outcome[1]}],
-                    "coords": [], "map_data": None, "chart_data": None, "timetable_data": None,
-                    "line_context": line_context, "plan_state": plan_state, "answer": outcome[1],
-                }
-                return
-
-            if outcome[0] == "error":
-                print(f"[Agent] Sequencer sub-goal failed: {outcome[1]}")
-                yield {
-                    "status": "done",
-                    "log": [{"type": "action", "tool": "sequencer", "args": {}, "observation": outcome[1]}],
-                    "coords": [], "map_data": None, "chart_data": None, "timetable_data": None,
-                    "line_context": line_context, "plan_state": None,
-                    "answer": f"I couldn't complete that comparison: {outcome[1]}",
-                }
-                return
-
-            _, value, _route_ids = outcome
-            subgoal = plan_state["subgoals"][plan_state["current_index"]]
-            plan_state["results"][subgoal["target"]] = value
-            plan_state["current_index"] += 1
-
-        # every sub-goal resolved - compute the verdict deterministically
-        # (arithmetic on numbers already fetched, not something the LLM
-        # should be trusted to state on its own) so the draft handed to
-        # _verify_answer already contains the answer, not just raw numbers.
-        # _verify_answer is instructed to add nothing beyond what's already
-        # in the draft - a bare number list would leave "who's bigger"
-        # unanswered, which is exactly what happened before this fix.
-        results = plan_state["results"]
-        numeric = {t: v for t, v in results.items() if isinstance(v, (int, float))}
-        detail = ", ".join(f"line {t} has {v}" for t, v in results.items())
-        if len(numeric) == len(results) and len(numeric) >= 2:
-            winner = max(numeric, key=numeric.get)
-            runner_up = min(numeric, key=numeric.get)
-            draft = f"{detail}. Line {winner} has the highest value; line {runner_up} has the lowest."
-        else:
-            draft = f"Comparing {plan_state['compare']} - {detail}."
-        final = _verify_answer(plan_state["original_question"], draft, provider, model, client)
-        # Mark the conversation as grounded (see already_grounded below) so a
-        # short follow-up like "so which one has more?" doesn't force a fresh
-        # tool call - the answer, including the explicit verdict above, is
-        # already sitting in the chat transcript for the model to read.
-        line_context.setdefault("given", {})["comparison_done"] = True
-        yield {
-            "status": "done",
-            "log": [{"type": "action", "tool": "sequencer", "args": {}, "observation": detail}],
-            "coords": [], "map_data": None, "chart_data": None, "timetable_data": None,
-            "line_context": line_context, "plan_state": None, "answer": final,
-        }
+    # --- Scoped sequencer: resume a pending sub-goal, start a new plan, resolve
+    # through to a finished comparison, or (returns None) fall through below ---
+    sequencer_result, model_idx = _run_sequencer_turn(question, plan_state, line_context, model_idx)
+    if sequencer_result is not None:
+        yield sequencer_result
         return
+    provider, model = MODEL_PRIORITY[model_idx]
+    client = get_client(provider)
 
     messages = get_messages(history, provider, line_context=line_context)
 
@@ -873,6 +933,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             cd = extract_chart_data(plot_result)
             yield {"status": "step", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": cd, "timetable_data": None, "line_context": line_context, "answer": None}
             summary = _summarize_frequency(question, sched_line_num, sched_agency, sched_result, provider, model, client)
+            summary = _with_closing_question(summary, _is_hebrew(question))
             yield {"status": "done", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": cd, "timetable_data": None, "line_context": line_context, "answer": summary}
             return
 
@@ -894,6 +955,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     answer = f"הנה לוח הזמנים לקו {sched_line_num} ({sched_agency}) ליום {day}:"
                 else:
                     answer = f"Here is the timetable for line {sched_line_num} ({sched_agency}) on {day.capitalize()}:"
+                answer = _with_closing_question(answer, _is_hebrew(question))
                 yield {"status": "done", "log": list(fast_log), "coords": [], "map_data": None, "chart_data": None, "timetable_data": td, "line_context": line_context, "answer": answer}
                 return
             # no day mentioned yet - fall through to the normal LLM flow, which is
@@ -1084,6 +1146,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             log.append({"type": "verify", "text": "checking the answer against the question"})
             yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
             content = _verify_answer(question, content, provider, model, client)
+            content = _with_closing_question(content, _is_hebrew(question))
             yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": content}
             return
 
