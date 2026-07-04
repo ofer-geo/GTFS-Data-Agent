@@ -313,23 +313,21 @@ with st.sidebar:
     st.markdown("### What I'm good at")
     st.markdown(
         "- Stops & stop order\n"
-        "- Departure timetables & frequency charts\n"
-        "- Operators & agencies\n"
-        "- Comparing two lines (stops, agency, first/last stop)"
+        "- Departure timetables & frequency\n"
+        "- Operators & agencies"
     )
 
     st.markdown("### Where I'm not the best yet")
     st.markdown(
-        "- Departure time at a specific stop (only per-trip times by direction, not per-stop arrival times)\n"
-        "- Comparing more than 2 lines at once\n"
+        "- Departure time at a specific stop\n"
         "- Occasional slowdowns when a model provider is rate-limited"
     )
 
     st.markdown("### Planned for the future")
     st.markdown(
-        "- Geospatial queries (route distance in km, nearest stop to a location)\n"
+        "- Geospatial queries\n"
         "- More robust multi-line comparison\n"
-        "- Real-time data (live position, delays)\n"
+        "- Real-time data\n"
         "- Fares & ticket pricing"
     )
 
