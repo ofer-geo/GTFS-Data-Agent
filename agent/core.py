@@ -465,6 +465,19 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
     Deliberately bypasses _call_llm/TOOLS_SCHEMA (no tools needed here) to
     keep this pass small - it's a token cost added on top of every answer,
     so it should stay minimal.
+
+    An earlier version of this tried passing this turn's real tool results
+    in and asking the model to fact-check the draft against them directly.
+    Tested against a deliberately fabricated draft (wrong stop count + a
+    fake stop name) and it failed two different ways depending on the
+    model: one rubber-stamped the fabrication unchanged; another got
+    confused about which data covered which line and incorrectly claimed
+    the data didn't cover it at all. LLMs aren't reliable at precisely
+    counting array entries or exact-matching strings in a data blob just
+    because it's "given real data" - so that approach was reverted.
+    Deterministic checks (see _verify_stop_counts) cover specific
+    high-risk fact types instead, without depending on an LLM to catch its
+    own arithmetic.
     """
     system = (
         "You are reviewing a draft answer to a user's public-transport question. "
@@ -499,6 +512,76 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
         return verified.strip() or draft
     except Exception:
         return draft
+
+
+def _stop_counts_from_tool_results(turn_tool_results: list) -> list:
+    """[(label, count), ...] from this turn's get_line_stops call(s) in the
+    main loop's raw (func_name, json_str) list - ground truth for
+    _verify_stop_counts."""
+    counts = []
+    for func_name, result in turn_tool_results:
+        if func_name != "get_line_stops":
+            continue
+        try:
+            directions = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(directions, list):
+            for d in directions:
+                if isinstance(d, dict) and isinstance(d.get("stops_count"), int):
+                    counts.append((d.get("headsign", "?"), d["stops_count"]))
+    return counts
+
+
+def _stop_counts_from_sequencer_results(results: dict) -> list:
+    """Same shape as _stop_counts_from_tool_results, built from the
+    sequencer's already-parsed results dict instead (target -> per-direction
+    dict for count_stops, or a plain value for other goal_types - only
+    integers are ever real stop counts, so strings/agency names are
+    naturally skipped)."""
+    counts = []
+    for target, value in results.items():
+        if isinstance(value, dict):
+            for headsign, v in value.items():
+                if isinstance(v, int):
+                    counts.append((f"line {target} ({headsign})", v))
+        elif isinstance(value, int):
+            counts.append((f"line {target}", value))
+    return counts
+
+
+def _verify_stop_counts(answer: str, counts: list, hebrew: bool) -> str:
+    """
+    Deterministic stop-count check. An LLM-based "fact-check the draft
+    against real data" pass was tried and reverted (see _verify_answer's
+    docstring) after it proved unreliable - it either rubber-stamped a
+    fabricated count, or got confused about which data covered which line.
+    A plain Python comparison has neither failure mode, for this specific
+    fact type that's exactly what fabricated in the incident that prompted
+    this whole sweep.
+
+    Doesn't edit the answer's prose in place - regex-splicing a corrected
+    number into a sentence risks producing broken grammar, especially
+    across Hebrew/English phrasing. Instead, if any number that looks like
+    a stop-count claim (immediately followed by "stop(s)"/"תחנה/תחנות")
+    doesn't match a real per-direction or total count, appends the
+    verified real numbers as a clear addendum rather than silently
+    trusting - or trying to rewrite - the model's prose.
+    """
+    if not counts:
+        return answer  # get_line_stops wasn't used this turn - nothing to check
+
+    real_values = {c for _, c in counts}
+    real_values.add(sum(c for _, c in counts))
+
+    claimed = {int(n) for n in re.findall(r"\b(\d+)\b(?=\s*(?:stops?\b|תחנות\b|תחנה\b))", answer)}
+    if not claimed or claimed <= real_values:
+        return answer
+
+    detail = ", ".join(f"{label}: {c}" for label, c in counts)
+    if hebrew:
+        return answer + f"\n\n(מספרי תחנות מאומתים: {detail})"
+    return answer + f"\n\n(Verified stop counts: {detail})"
 
 
 # ---------------------------------------------------------------------------
@@ -839,6 +922,7 @@ def _finish_sequencer(plan_state: dict, line_context: dict, provider: str, model
         draft = f"Comparing {plan_state.get('compare', '')} - {detail}."
 
     final = _verify_answer(plan_state["original_question"], draft, provider, model, client)
+    final = _verify_stop_counts(final, _stop_counts_from_sequencer_results(results), hebrew)
     if chart_data and map_data:
         final += (" הצגתי גם תרשים השוואה ומפה עם המסלולים של כל הקווים." if hebrew
                   else " I've also shown a comparison chart and a map with all the compared lines.")
@@ -1042,6 +1126,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
     MAX_OBS_CHARS = 2000
     current_response = None
     tool_call_names = {}  # call_id → func_name, used for trimming
+    turn_tool_results = []  # [(func_name, raw_result), ...] this turn - see _stop_counts_from_tool_results
     pending_plot_args = None  # set after get_departure_schedule until plot_departure_schedule runs
     data_tool_used = False  # set once a real answer-producing tool (stops/map/sql/schedule) has run
 
@@ -1231,6 +1316,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             log.append({"type": "verify", "text": "checking the answer against the question"})
             yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
             content = _verify_answer(question, content, provider, model, client)
+            content = _verify_stop_counts(content, _stop_counts_from_tool_results(turn_tool_results), _is_hebrew(question))
             content = _with_closing_question(content, _is_hebrew(question))
             yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": content}
             return
@@ -1291,6 +1377,13 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     # whole request.
                     print(f"[Agent] Tool call failed - {func_name}({args}): {type(e).__name__}: {e}")
                     result = f"Error calling {func_name}({args}): {e}"
+                else:
+                    # Raw, untruncated result - kept for the deterministic
+                    # stop-count check (_stop_counts_from_tool_results) to
+                    # read ground truth from, separate from `trimmed` below
+                    # which is what actually goes into ongoing message
+                    # history and can be capped/replaced.
+                    turn_tool_results.append((func_name, result))
                 tool_calls_made += 1
 
             try:
