@@ -359,6 +359,53 @@ def _is_hebrew(text: str) -> bool:
     return bool(re.search(r"[֐-׿]", text))
 
 
+_UNSUPPORTED_TOPICS = [
+    # (label, keyword set) - the 3 known, enumerated gaps this database has:
+    # no shapes.txt (no route geometry/distance), no fare_rules (no ticket
+    # prices), and static GTFS only (no real-time data). See prompts.py's
+    # "Out of scope" rule for the same list - this is the mechanical
+    # counterpart, not a replacement for it.
+    ("route distance/length", {
+        "distance", "km", "kilomet", "how far", "route length", "length of the route",
+        "מרחק", "קילומטר", "אורך המסלול", "כמה רחוק",
+    }),
+    ("fares or ticket prices", {
+        "fare", "ticket price", "how much does it cost", "cost of a ticket",
+        "מחיר כרטיס", "עלות נסיעה", "תעריף",
+    }),
+    ("real-time or live data", {
+        "real-time", "real time", "live location", "current location of the bus",
+        "is the bus late", "is the bus delayed", "where is the bus now",
+        "בזמן אמת", "איחור", "מאחר", "איפה האוטובוס עכשיו",
+    }),
+]
+
+
+def _detect_unsupported_topic(question: str):
+    """
+    Deterministic pre-check, run BEFORE any LLM call: does this question
+    ask about something structurally absent from this database? If so,
+    answer immediately and honestly instead of spending an LLM call that
+    could either hallucinate an answer or need several tool round-trips
+    just to conclude "I can't do this" - zero tokens, zero fabrication
+    risk, since the model never sees the question at all for this turn.
+
+    Deliberately narrow and keyword-based (same style as
+    is_schedule_question) - this only covers the 3 KNOWN, enumerated gaps
+    this database has (see _UNSUPPORTED_TOPICS), not a general "can I
+    answer this" classifier; a newly discovered gap just needs one more
+    entry added there. A compound question that also asks something
+    answerable alongside an unsupported part will still short-circuit
+    entirely - an accepted tradeoff given the message invites the user to
+    re-ask the answerable part separately.
+    """
+    t = question.lower()
+    for label, keywords in _UNSUPPORTED_TOPICS:
+        if any(kw in t for kw in keywords):
+            return label
+    return None
+
+
 _GENERAL_DB_KEYWORDS = {
     "how many", "most", "least", "highest", "lowest", "longest", "shortest", "average", "total",
     "כמה", "הכי", "בממוצע", "בסך הכל", "הארוך ביותר", "הקצר ביותר", "הרב ביותר", "המעט ביותר",
@@ -1113,6 +1160,28 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
     history = list(context or []) + [{"role": "user", "content": question}]
     print(f"[Agent] New query -> provider={provider!r} model={model!r}")
+
+    # --- Known-unsupported-topic short-circuit: zero LLM calls, zero risk ---
+    unsupported = _detect_unsupported_topic(question)
+    if unsupported:
+        hebrew = _is_hebrew(question)
+        if hebrew:
+            answer = (
+                f"אין לי כרגע כלי שמספק מידע על {unsupported} — מסד הנתונים הזה כולל רק את לוח הזמנים "
+                "הסטטי (קווים, תחנות, מסלולים ולוחות זמנים), ללא נתוני מסלול גיאוגרפיים, מחירים או מידע "
+                "בזמן אמת. אשמח לעזור בשאלה אחרת על התחבורה הציבורית — יש עוד משהו שאוכל לעזור בו?"
+            )
+        else:
+            answer = (
+                f"I don't currently have a tool that provides {unsupported} — this database only has "
+                "the static schedule (lines, stops, routes, and timetables), not route geometry, prices, "
+                "or real-time data. Happy to help with a different public-transport question — is there "
+                "something else I can help with?"
+            )
+        print(f"[Agent] Short-circuit: unsupported topic ({unsupported}) - no LLM call made")
+        yield {"status": "done", "log": [], "coords": [], "chart_data": None, "timetable_data": None,
+               "line_context": line_context, "answer": answer}
+        return
 
     # --- Scoped sequencer: resume a pending sub-goal, start a new plan, resolve
     # through to a finished comparison, or (returns None) fall through below ---
