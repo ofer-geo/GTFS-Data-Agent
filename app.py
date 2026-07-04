@@ -308,20 +308,34 @@ def _agent_thread(question, context, result_queue, stop_event, line_context, pla
 
 # --- Sidebar ---
 with st.sidebar:
+    st.markdown("<style>section[data-testid='stSidebar'] .block-container{padding-top:1rem;}</style>", unsafe_allow_html=True)
     st.caption("Free tier models — the agent automatically switches models if one runs low on quota.")
     st.markdown("### What I'm good at")
-    st.caption("Stops & stop order · Departure timetables & frequency charts · Operators & agencies · Comparing two lines (stops, agency, first/last stop)")
+    st.markdown(
+        "- Stops & stop order\n"
+        "- Departure timetables & frequency charts\n"
+        "- Operators & agencies\n"
+        "- Comparing two lines (stops, agency, first/last stop)"
+    )
 
     st.markdown("### Where I'm not the best yet")
-    st.caption("Departure time at a specific stop (I only have per-trip times by direction, not per-stop arrival times) · Comparing more than 2 lines at once · Occasional slowdowns when a model provider is rate-limited")
+    st.markdown(
+        "- Departure time at a specific stop (only per-trip times by direction, not per-stop arrival times)\n"
+        "- Comparing more than 2 lines at once\n"
+        "- Occasional slowdowns when a model provider is rate-limited"
+    )
 
     st.markdown("### Planned for the future")
-    st.caption("Geospatial queries (route distance in km, nearest stop to a location) · More robust multi-line comparison · Real-time data (live position, delays) · Fares & ticket pricing")
+    st.markdown(
+        "- Geospatial queries (route distance in km, nearest stop to a location)\n"
+        "- More robust multi-line comparison\n"
+        "- Real-time data (live position, delays)\n"
+        "- Fares & ticket pricing"
+    )
 
     st.markdown("### Questions for example")
     EXAMPLES = [
         "What is the first stop of line 189 of Dan?",
-        "How many operators run line 5?",
         "What is the timetable of line 125 of Dan on Thursday?",
         "How many trips has line 13 of Metropolin?",
     ]
@@ -329,7 +343,7 @@ with st.sidebar:
         if st.button(ex, use_container_width=True, disabled=st.session_state.agent_running):
             st.session_state["pending_question"] = ex
 
-    st.markdown("<div style='height:30vh'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:2vh'></div>", unsafe_allow_html=True)
     if st.button("New conversation", use_container_width=True,
                  disabled=st.session_state.agent_running):
         st.session_state["chat_history"] = []
