@@ -514,6 +514,31 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
         return draft
 
 
+def _claims_stops_without_fetching(answer: str, line_context: dict) -> bool:
+    """
+    Deterministic red flag, checked BEFORE the answer is accepted (not
+    after, like _verify_stop_counts): does the answer list individual
+    stops - the "תחנה: X — קוד Y" / "stop: X - code Y" format the system
+    prompt mandates for real stop data - even though no get_line_stops-
+    shaped result has ever actually come back in this conversation?
+    line_context["given"]["stops"] is only set to True when get_line_stops,
+    or select_option dispatching a direction choice, actually returns real
+    data (see the main loop's line_context tracking).
+
+    This catches exactly what _verify_stop_counts can't: that check only
+    compares a claimed COUNT against a real one, and a fabricated stop
+    list can have the right count (stops_count was visible even when
+    individual stops were invented) while every individual name/code is
+    made up. Known limitation: the flag doesn't track WHICH line's stops
+    were fetched, so in a conversation comparing two lines it could miss a
+    fabrication for a second line once the first line's stops are real -
+    still strictly better than no check, and directly catches the
+    observed single-line failure.
+    """
+    stop_line_pattern = re.compile(r"(תחנה\s*[:：]|stop\s*[:：]\s*\S)", re.IGNORECASE)
+    return bool(stop_line_pattern.search(answer)) and not line_context.get("given", {}).get("stops")
+
+
 def _stop_counts_from_tool_results(turn_tool_results: list) -> list:
     """[(label, count), ...] from this turn's get_line_stops-shaped result(s)
     in the main loop's raw (func_name, json_str) list - ground truth for
@@ -1280,6 +1305,19 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     f"You called get_departure_schedule but haven't called plot_departure_schedule yet. "
                     f"Call plot_departure_schedule(route_ids={pending_plot_args['route_ids']}, "
                     f"specific_day={pending_plot_args['specific_day']!r}) now, then give your final answer."})
+                continue
+
+            if _claims_stops_without_fetching(content, line_context):
+                if _bail_if_stuck("stops_not_fetched"):
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    return
+                log.append({"type": "retry", "text": "answer lists stops that were never actually fetched - retrying"})
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                messages.append({"role": "user", "content":
+                    "Your answer lists individual stops, but you have not actually called get_line_stops "
+                    "(or select_option after a direction question) in this conversation. Every stop name "
+                    "and code must come from that tool's real returned data - call the right one now with "
+                    "the correct route_id(s), then answer using only what it returns."})
                 continue
 
             already_grounded = (
