@@ -601,25 +601,37 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
 # later means adding one line here, not writing a new function.
 def _looks_like_stop_list(answer: str) -> bool:
     """
-    Detects an individually-listed set of stops by combining two signals,
-    not just one literal template: (1) the exact "תחנה: X — קוד Y" / "stop:
-    X - code Y" format the system prompt mandates, which also catches even
-    a single non-fetched stop mention; (2) a broader SHAPE check - 5+
-    numbered list lines, each containing a stop-code-like 4-6 digit number
-    - which catches a fabricated list that doesn't follow the literal
-    template at all. Verified live: one fabrication used "תחנה: X — קוד Y"
-    (caught by (1)); a later, different fabrication used "N. תחנת X — קוד
-    Y" (numbered list, "תחנת" not "תחנה", no colon) - (1) alone missed it
-    completely, since it's a different literal phrasing, but (2) catches
-    it by structure regardless of the exact words used.
+    Detects an individually-listed set of stops. Deliberately anchored to
+    a LAYOUT-INDEPENDENT signal - count how many stop-code-shaped (4-6
+    digit) numbers appear anywhere in the text, regardless of whether
+    they're presented as a numbered list, a markdown table, bullets, or
+    inline prose - rather than matching any specific list/bullet/table
+    formatting.
+
+    This is the third iteration of this check, and each of the first two
+    got evaded by a DIFFERENT fabrication that happened to use different
+    surface formatting than the one being matched: v1 matched only the
+    literal "תחנה: X — קוד Y" template; a live fabrication used "N. תחנת X
+    — קוד Y" instead (no colon) and slipped through. v2 added a check for
+    numbered list lines (a digit followed by "." or ")"); a later live fabrication used a
+    markdown table ("| 1 | ... | קוד 100001 |") instead, which doesn't
+    start a line with a bare number, and slipped through that too. Chasing
+    surface formatting is a losing game - anchoring to "are there simply
+    many stop-code-shaped numbers in this text at all" doesn't care what
+    structure surrounds them.
+
+    5+ occurrences of a 4-6 digit number is unlikely for any other reason
+    in this domain: line numbers are 1-4 digits, times are HH:MM,
+    coordinates are decimals (lat/lon). Real stop codes in this feed are
+    1-5 digits (verified against the actual data) and fabricated ones
+    observed live used 6-digit sequential codes - the wider 4-6 range
+    stays inclusive of both rather than narrowing to whichever digit
+    count happened to show up in fabrications seen so far.
     """
     if re.search(r"(תחנה\s*[:：]|stop\s*[:：]\s*\S)", answer, re.IGNORECASE):
         return True
-    numbered_lines_with_codes = sum(
-        1 for line in answer.splitlines()
-        if re.match(r"^\s*\d+[.)]\s", line) and re.search(r"\b\d{4,6}\b", line)
-    )
-    return numbered_lines_with_codes >= 5
+    code_like_numbers = re.findall(r"\b\d{4,6}\b", answer)
+    return len(code_like_numbers) >= 5
 
 
 _FACT_PATTERNS = [
