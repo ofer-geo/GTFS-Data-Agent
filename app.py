@@ -167,6 +167,7 @@ for key, default in {
     "agent_map_data": None,
     "agent_chart_data": None,
     "agent_timetable_data": None,
+    "agent_stops_data": None,
     "agent_answer": None,
     "stop_event": None,
     "line_context": None,
@@ -250,6 +251,30 @@ def render_timetable(timetable_data: dict):
     if day:
         st.caption(f"Timetable — {day.capitalize()}")
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def render_stops_table(stops_data: dict):
+    """
+    Renders the real stop list directly from tool data, one table per
+    direction - the model is never asked to retype individual stop names/
+    codes as prose (see prompts.py's stop-question instructions and
+    extract_stops_data's docstring in core.py): a live test showed a model
+    given the exact right data still fabricated every stop when asked to
+    write it out itself. Same reasoning already applied to departure
+    times via render_timetable, now applied to stops too.
+    """
+    directions = stops_data.get("directions", [])
+    for d in directions:
+        headsign = d.get("headsign", "?")
+        stops = d.get("stops", [])
+        if not stops:
+            continue
+        st.caption(f"Stops — {headsign} ({len(stops)})")
+        df = pd.DataFrame([
+            {"#": s.get("sequence"), "Stop": s.get("stop_name"), "Code": s.get("stop_code")}
+            for s in stops
+        ])
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def render_route_map(map_data: dict):
@@ -412,6 +437,8 @@ with col_chat:
                 st.markdown(msg["content"])
                 if msg.get("timetable_data"):
                     render_timetable(msg["timetable_data"])
+                if msg.get("stops_data"):
+                    render_stops_table(msg["stops_data"])
 
         # ── Agent running: poll and show live progress ──
         if st.session_state.agent_running:
@@ -431,6 +458,7 @@ with col_chat:
                         "map_data": st.session_state.agent_map_data,
                         "chart_data": st.session_state.agent_chart_data,
                         "timetable_data": st.session_state.agent_timetable_data,
+                        "stops_data": st.session_state.agent_stops_data,
                     })
                     st.rerun()
 
@@ -442,6 +470,8 @@ with col_chat:
                     st.session_state.agent_chart_data = update["chart_data"]
                 if update.get("timetable_data"):
                     st.session_state.agent_timetable_data = update["timetable_data"]
+                if update.get("stops_data"):
+                    st.session_state.agent_stops_data = update["stops_data"]
                 if update.get("line_context"):
                     st.session_state.line_context = update["line_context"]
                 if "plan_state" in update:
@@ -490,6 +520,8 @@ with col_chat:
                     st.markdown(st.session_state.agent_answer)
                 if st.session_state.agent_timetable_data:
                     render_timetable(st.session_state.agent_timetable_data)
+                if st.session_state.agent_stops_data:
+                    render_stops_table(st.session_state.agent_stops_data)
 
     # ── Input below the scrollable window ──
     if st.session_state.agent_running:
@@ -513,6 +545,7 @@ with col_chat:
             st.session_state.agent_map_data = None
             st.session_state.agent_chart_data = None
             st.session_state.agent_timetable_data = None
+            st.session_state.agent_stops_data = None
             st.session_state.agent_answer = None
             st.session_state.stop_event = threading.Event()
             st.session_state.agent_queue = queue.Queue()
