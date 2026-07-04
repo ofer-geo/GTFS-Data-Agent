@@ -309,8 +309,14 @@ def _agent_thread(question, context, result_queue, stop_event, line_context, pla
 # --- Sidebar ---
 with st.sidebar:
     st.caption("Free tier models — the agent automatically switches models if one runs low on quota.")
-    st.markdown("### What I can help with")
-    st.caption("Stops & stop order · Departure schedule & timetable · Operators & agencies")
+    st.markdown("### What I'm good at")
+    st.caption("Stops & stop order · Departure timetables & frequency charts · Operators & agencies · Comparing two lines (stops, agency, first/last stop)")
+
+    st.markdown("### Where I'm not the best yet")
+    st.caption("Departure time at a specific stop (I only have per-trip times by direction, not per-stop arrival times) · Comparing more than 2 lines at once · Occasional slowdowns when a model provider is rate-limited")
+
+    st.markdown("### Planned for the future")
+    st.caption("Geospatial queries (route distance in km, nearest stop to a location) · More robust multi-line comparison · Real-time data (live position, delays) · Fares & ticket pricing")
 
     st.markdown("### Questions for example")
     EXAMPLES = [
