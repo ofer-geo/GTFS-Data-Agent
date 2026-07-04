@@ -514,29 +514,58 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
         return draft
 
 
-def _claims_stops_without_fetching(answer: str, line_context: dict) -> bool:
+# Registry of known "detailed factual content" shapes this app can produce,
+# each paired with the line_context["given"] flag that's only set True once
+# a real tool has actually returned that kind of data somewhere in this
+# conversation (see the main loop's line_context tracking). Generalizes the
+# check across every fact type the app knows how to fetch, instead of one
+# bespoke check for stops specifically - adding a new fact-producing tool
+# later means adding one line here, not writing a new function.
+_FACT_PATTERNS = [
+    ("stop list", re.compile(r"(תחנה\s*[:：]|stop\s*[:：]\s*\S)", re.IGNORECASE), "stops"),
+    ("departure time", re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b"), "timetable_days"),
+]
+
+
+def _claims_facts_without_fetching(answer: str, line_context: dict):
     """
     Deterministic red flag, checked BEFORE the answer is accepted (not
-    after, like _verify_stop_counts): does the answer list individual
-    stops - the "תחנה: X — קוד Y" / "stop: X - code Y" format the system
-    prompt mandates for real stop data - even though no get_line_stops-
-    shaped result has ever actually come back in this conversation?
-    line_context["given"]["stops"] is only set to True when get_line_stops,
-    or select_option dispatching a direction choice, actually returns real
-    data (see the main loop's line_context tracking).
+    after, like _verify_stop_counts): does the answer contain a shape of
+    content that only a specific real tool call could have produced (see
+    _FACT_PATTERNS), while line_context shows that tool has never actually
+    returned data in this conversation? Returns the matched fact-type
+    label if so, else None.
 
-    This catches exactly what _verify_stop_counts can't: that check only
-    compares a claimed COUNT against a real one, and a fabricated stop
-    list can have the right count (stops_count was visible even when
-    individual stops were invented) while every individual name/code is
-    made up. Known limitation: the flag doesn't track WHICH line's stops
-    were fetched, so in a conversation comparing two lines it could miss a
-    fabrication for a second line once the first line's stops are real -
-    still strictly better than no check, and directly catches the
-    observed single-line failure.
+    This catches what _verify_stop_counts structurally can't: a fabricated
+    stop list can have a correct-looking overall COUNT (stops_count was
+    visible even while individual stops were invented), which passes a
+    count-only check, but no legitimate answer contains per-stop detail if
+    that data was never fetched at all.
+
+    Deliberately NOT "any final answer with zero tool calls this turn is
+    suspect" - that blanket version was considered and rejected: it would
+    break the sequencer's already-validated "so which one has more?"
+    follow-up (line_context["given"]["comparison_done"]), which
+    legitimately reuses an earlier turn's real data without a redundant
+    fresh tool call, exactly as the system prompt allows. Checking per
+    fact TYPE whether the conversation has EVER actually fetched that kind
+    of data (not just this turn) handles cross-turn reuse correctly while
+    still catching content with no backing tool call anywhere.
+
+    Known limits: doesn't track which LINE a fact belongs to (a multi-line
+    conversation could miss a second line's fabrication once the first
+    line's data is real), and only covers fact types with a pattern
+    registered above - a genuinely new fact type still needs one added.
+    Full generality would mean fact-checking arbitrary prose against
+    arbitrary data, which was tried with an LLM and proved unreliable (see
+    _verify_answer's docstring) - this trades some coverage for actually
+    being reliable on the fact types it does check.
     """
-    stop_line_pattern = re.compile(r"(תחנה\s*[:：]|stop\s*[:：]\s*\S)", re.IGNORECASE)
-    return bool(stop_line_pattern.search(answer)) and not line_context.get("given", {}).get("stops")
+    given = line_context.get("given", {})
+    for label, pattern, given_key in _FACT_PATTERNS:
+        if pattern.search(answer) and not given.get(given_key):
+            return label
+    return None
 
 
 def _stop_counts_from_tool_results(turn_tool_results: list) -> list:
@@ -1307,17 +1336,18 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     f"specific_day={pending_plot_args['specific_day']!r}) now, then give your final answer."})
                 continue
 
-            if _claims_stops_without_fetching(content, line_context):
-                if _bail_if_stuck("stops_not_fetched"):
+            unfetched_fact = _claims_facts_without_fetching(content, line_context)
+            if unfetched_fact:
+                if _bail_if_stuck(f"facts_not_fetched:{unfetched_fact}"):
                     yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
                     return
-                log.append({"type": "retry", "text": "answer lists stops that were never actually fetched - retrying"})
+                log.append({"type": "retry", "text": f"answer states a {unfetched_fact} that was never actually fetched - retrying"})
                 yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
                 messages.append({"role": "user", "content":
-                    "Your answer lists individual stops, but you have not actually called get_line_stops "
-                    "(or select_option after a direction question) in this conversation. Every stop name "
-                    "and code must come from that tool's real returned data - call the right one now with "
-                    "the correct route_id(s), then answer using only what it returns."})
+                    f"Your answer contains what looks like a real {unfetched_fact}, but the tool that would "
+                    "provide that has not actually returned data in this conversation. Every fact you state "
+                    "must come from a tool's real returned data - call the right tool now, then answer using "
+                    "only what it returns."})
                 continue
 
             already_grounded = (
