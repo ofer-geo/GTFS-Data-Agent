@@ -663,14 +663,21 @@ def _looks_like_stop_list(answer: str) -> bool:
 _FACT_PATTERNS = [
     # (label, matches, given_key) - given_key=None means "block whenever
     # matched, regardless of whether this kind of data was ever fetched."
-    # Stops use None: the current architecture renders the real stop list
-    # as a table (see extract_stops_data/render_stops_table) and tells the
-    # model to never retype it as prose, even once fetched - unlike other
-    # fact types, there is no legitimate reason for stop codes to appear
-    # in the model's own text at all, so reuse-after-fetching isn't a
-    # case to allow through here.
+    # Stops and departure times both use None: this architecture renders
+    # both as a real table (extract_stops_data/render_stops_table,
+    # extract_timetable_data/render_timetable) and tells the model to
+    # never retype them as prose, even once fetched - unlike other fact
+    # types, there is no legitimate reason for a specific stop code or
+    # departure time to appear in the model's own text at all, so
+    # reuse-after-fetching isn't a case to allow through here. Verified
+    # live: get_departure_timetable was actually called (timetable_days
+    # was already truthy), but the model still wrote 8 suspiciously round
+    # hour-only times ("11:00", "12:00", ...) in its own text that didn't
+    # match the real per-trip data - the same "correctly fetched, still
+    # retyped and fabricated" failure already seen and fixed for stops,
+    # just not yet applied here until now.
     ("stop list", _looks_like_stop_list, None),
-    ("departure time", lambda a: bool(re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", a)), "timetable_days"),
+    ("departure time", lambda a: bool(re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", a)), None),
 ]
 
 
