@@ -278,6 +278,32 @@ def extract_timetable_data(result: str) -> dict | None:
     return None
 
 
+def extract_stops_data(result: str) -> dict | None:
+    """
+    Wraps a get_line_stops-shaped result (a list of per-direction dicts,
+    from get_line_stops directly or select_option's direction dispatch -
+    detected by shape like _stop_counts_from_tool_results) for deterministic
+    UI rendering, the same pattern as extract_timetable_data/
+    extract_chart_data. The point: stop names and codes should be rendered
+    from this real data directly, never retyped by the model as prose -
+    the same reasoning that already keeps departure times out of the
+    model's own text (see prompts.py's timetable instructions), applied to
+    stops. Verified live: a model given the exact right data still
+    fabricated every stop name/code when asked to write them out in
+    prose - the fix isn't a smarter check, it's not asking it to
+    transcribe the list at all.
+    """
+    try:
+        data = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(data, list) and data and all(
+        isinstance(d, dict) and "stops_count" in d for d in data
+    ):
+        return {"stops_type": "line_stops", "directions": data}
+    return None
+
+
 def _summarize_tool_result(func_name: str, content: str) -> str:
     """Condense a tool result to a one-line summary for message history trimming."""
     if len(content) <= 300:
@@ -635,7 +661,15 @@ def _looks_like_stop_list(answer: str) -> bool:
 
 
 _FACT_PATTERNS = [
-    ("stop list", _looks_like_stop_list, "stops"),
+    # (label, matches, given_key) - given_key=None means "block whenever
+    # matched, regardless of whether this kind of data was ever fetched."
+    # Stops use None: the current architecture renders the real stop list
+    # as a table (see extract_stops_data/render_stops_table) and tells the
+    # model to never retype it as prose, even once fetched - unlike other
+    # fact types, there is no legitimate reason for stop codes to appear
+    # in the model's own text at all, so reuse-after-fetching isn't a
+    # case to allow through here.
+    ("stop list", _looks_like_stop_list, None),
     ("departure time", lambda a: bool(re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", a)), "timetable_days"),
 ]
 
@@ -644,30 +678,27 @@ def _claims_facts_without_fetching(answer: str, line_context: dict):
     """
     Deterministic red flag, checked BEFORE the answer is accepted (not
     after, like _verify_stop_counts): does the answer contain a shape of
-    content that only a specific real tool call could have produced (see
-    _FACT_PATTERNS), while line_context shows that tool has never actually
-    returned data in this conversation? Returns the matched fact-type
-    label if so, else None.
+    content that shouldn't be in the model's own text at all (see
+    _FACT_PATTERNS)? Returns the matched fact-type label if so, else None.
 
-    This catches what _verify_stop_counts structurally can't: a fabricated
-    stop list can have a correct-looking overall COUNT (stops_count was
-    visible even while individual stops were invented), which passes a
-    count-only check, but no legitimate answer contains per-stop detail if
-    that data was never fetched at all.
+    Most entries only block when line_context shows the matching tool has
+    never actually returned data in this conversation - reusing an
+    already-fetched fact without a redundant tool call is legitimate (see
+    the sequencer's "so which one has more?" follow-up,
+    given["comparison_done"]). The stop-list entry is the exception
+    (given_key=None): stops are always rendered as a real table now, so a
+    stop-code listing in the model's own text is wrong regardless of
+    whether the data was fetched - verified live that this exception is
+    necessary, not just theoretical: a model given the exact right stop
+    data still wrote out a partial fabricated table alongside the real
+    one instead of the required one-sentence acknowledgment.
 
     Deliberately NOT "any final answer with zero tool calls this turn is
-    suspect" - that blanket version was considered and rejected: it would
-    break the sequencer's already-validated "so which one has more?"
-    follow-up (line_context["given"]["comparison_done"]), which
-    legitimately reuses an earlier turn's real data without a redundant
-    fresh tool call, exactly as the system prompt allows. Checking per
-    fact TYPE whether the conversation has EVER actually fetched that kind
-    of data (not just this turn) handles cross-turn reuse correctly while
-    still catching content with no backing tool call anywhere.
+    suspect" for every fact type - that blanket version would break the
+    sequencer follow-up above for facts where reuse genuinely is fine.
 
-    Known limits: doesn't track which LINE a fact belongs to (a multi-line
-    conversation could miss a second line's fabrication once the first
-    line's data is real), and only covers fact types with a pattern
+    Known limits: doesn't track which LINE a fact belongs to for the
+    reuse-gated entries, and only covers fact types with a pattern
     registered above - a genuinely new fact type still needs one added.
     Full generality would mean fact-checking arbitrary prose against
     arbitrary data, which was tried with an LLM and proved unreliable (see
@@ -676,7 +707,9 @@ def _claims_facts_without_fetching(answer: str, line_context: dict):
     """
     given = line_context.get("given", {})
     for label, matches, given_key in _FACT_PATTERNS:
-        if matches(answer) and not given.get(given_key):
+        if not matches(answer):
+            continue
+        if given_key is None or not given.get(given_key):
             return label
     return None
 
@@ -1332,6 +1365,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
     map_data = None
     chart_data = None
     timetable_data = None
+    stops_data = None
     tool_calls_made = 0
     MAX_OBS_CHARS = 2000
     current_response = None
@@ -1377,7 +1411,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
         # --- Check stop request ---
         if stop_event and stop_event.is_set():
-            yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": "Stopped by user."}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": "Stopped by user."}
             return
 
         # --- Call the LLM ---
@@ -1390,10 +1424,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
             if "tool_use_failed" in es or (status == 400 and "tool" in es.lower()):
                 if _bail_if_stuck("tool_use_failed"):
-                    yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": _stuck_answer()}
                     return
                 log.append({"type": "retry", "text": "tool_use_failed - retrying"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                 messages.append({"role": "user", "content":
                     "Your previous tool call was malformed. Use the structured "
                     "function-calling format. Try again."})
@@ -1419,7 +1453,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     "to_model": model,
                     "limit_type": _detect_limit_type(es),
                 })
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                 continue
 
             # --- Whole chain exhausted ---
@@ -1435,7 +1469,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     "limit_type": limit_type,
                     "wait_s": wait_s,
                 })
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                 for _ in range(wait_s * 2):  # 0.5s steps, interruptible
                     if stop_event and stop_event.is_set():
                         break
@@ -1445,7 +1479,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             # An unrecognized error, and every model in the chain has now
             # failed on it - waiting wouldn't obviously help, so surface a
             # clear message instead of crashing with a raw exception.
-            yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": _stuck_answer()}
             return
 
         content, tool_calls = _parse_response(current_response, provider)
@@ -1459,10 +1493,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
         if not tool_calls:
             if '"type": "function"' in content or ('"name":' in content and '"arguments":' in content):
                 if _bail_if_stuck("tool_call_as_text"):
-                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": _stuck_answer()}
                     return
                 log.append({"type": "retry", "text": "model emitted tool call as text - retrying"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                 messages.append({"role": "user", "content":
                     "You wrote a tool call as plain text. Use the real function-calling "
                     "mechanism, or give your final answer in plain language."})
@@ -1474,15 +1508,15 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 # being resolved - override it with the deterministic question rather
                 # than risk shipping a hallucinated answer built from no real data.
                 answer = _schedule_type_question(history)
-                yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": answer}
+                yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": answer}
                 return
 
             if pending_plot_args is not None:
                 if _bail_if_stuck("missing_plot_call"):
-                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": _stuck_answer()}
                     return
                 log.append({"type": "retry", "text": "must call plot_departure_schedule before finishing - retrying"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                 messages.append({"role": "user", "content":
                     f"You called get_departure_schedule but haven't called plot_departure_schedule yet. "
                     f"Call plot_departure_schedule(route_ids={pending_plot_args['route_ids']}, "
@@ -1492,10 +1526,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             unfetched_fact = _claims_facts_without_fetching(content, line_context)
             if unfetched_fact:
                 if _bail_if_stuck(f"facts_not_fetched:{unfetched_fact}"):
-                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": _stuck_answer()}
                     return
                 log.append({"type": "retry", "text": f"answer states a {unfetched_fact} that was never actually fetched - retrying"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                 messages.append({"role": "user", "content":
                     f"Your answer contains what looks like a real {unfetched_fact}, but the tool that would "
                     "provide that has not actually returned data in this conversation. Every fact you state "
@@ -1515,10 +1549,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             if (tool_calls_made == 0 and not line_context.get("given", {}).get("run_sql_used")
                     and _looks_like_general_db_question(question)):
                 if _bail_if_stuck("run_sql_not_used"):
-                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": _stuck_answer()}
                     return
                 log.append({"type": "retry", "text": "general database question answered without calling run_sql - retrying"})
-                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                 messages.append({"role": "user", "content":
                     "This looks like a general database question. Call run_sql() to get the real answer "
                     "before responding - do not answer from memory, even if you discussed something else "
@@ -1548,10 +1582,10 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 is_transport = any(kw in first_user_msg.lower() for kw in transport_keywords)
                 if is_transport:
                     if _bail_if_stuck("no_tool_called"):
-                        yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                        yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": _stuck_answer()}
                         return
                     log.append({"type": "retry", "text": "model answered without calling any tool - retrying"})
-                    yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                    yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                     messages.append({"role": "user", "content":
                         "You have NOT called any tool yet. "
                         "For questions about a specific line number, call get_line_variants() first. "
@@ -1560,11 +1594,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
             coords += extract_coords(content)
             log.append({"type": "verify", "text": "checking the answer against the question"})
-            yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+            yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
             content = _verify_answer(question, content, provider, model, client)
             content = _verify_stop_counts(content, _stop_counts_from_tool_results(turn_tool_results), _is_hebrew(question))
             content = _with_closing_question(content, _is_hebrew(question))
-            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": content}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": content}
             return
 
         # --- Tool calls: execute and feed results back ---
@@ -1591,7 +1625,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 print(f"[Agent] Malformed tool call args from {model} for {func_name}: {tool_call.function.arguments[:200]!r}")
                 result = f"Error: tool call arguments were not valid JSON ({e}). Retry with valid JSON arguments."
                 log.append({"type": "action", "tool": func_name, "args": {}, "observation": result})
-                yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
                 _append_tool_result(messages, tool_call.id, func_name, result, provider, current_response)
                 continue
 
@@ -1604,11 +1638,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 # on-template reply - that round trip has drifted into long, unrelated
                 # "what do you mean?" answers on some fallback models.
                 answer = _schedule_type_question(history)
-                yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": answer}
+                yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": answer}
                 return
 
             yield {"status": "calling", "tool": func_name, "args": args,
-                   "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                   "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
 
             if func_name not in tools_map:
                 result = f"Error: tool '{func_name}' does not exist."
@@ -1664,6 +1698,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 if td:
                     timetable_data = td
 
+            if func_name in ("get_line_stops", "select_option"):
+                sd = extract_stops_data(result)
+                if sd:
+                    stops_data = sd
+
             # --- Keep the persistent line-context summary current ---
             # (see get_messages()'s CONVERSATION CONTEXT block) so a later turn
             # doesn't have to re-derive the line, its directions, or what's
@@ -1701,7 +1740,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
 
             log.append({"type": "action", "tool": func_name, "args": args, "observation": result[:500]})
             coords += extract_coords(result)
-            yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": None}
+            yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": None}
 
             # A get_line_stops-shaped result (a list of per-direction dicts
             # with stops_count) is exempt from the generic cap regardless of
@@ -1768,7 +1807,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
             if md:
                 map_data = md
                 log.append({"type": "action", "tool": "plot_route_map", "args": {"route_ids": route_ids}, "observation": map_result[:500]})
-                yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": None}
+                yield {"status": "step", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": None}
 
             # Auto-build the frequency chart (working days / Friday / Saturday
             # breakdown) for the resolved line, same pattern as the map above
@@ -1785,7 +1824,7 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                                 "observation": chart_result[:500]})
                     yield {"status": "step", "log": list(log), "coords": list(coords),
                            "map_data": map_data, "chart_data": chart_data,
-                           "timetable_data": timetable_data, "line_context": line_context, "answer": None}
+                           "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": None}
             except Exception as e:
                 print(f"[Agent] Auto-chart failed: {e}")
 
@@ -1885,9 +1924,9 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                         "to_model": model,
                         "limit_type": _detect_limit_type(es),
                     })
-                    yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                    yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "answer": None}
 
-            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": content}
+            yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "stops_data": stops_data, "line_context": line_context, "answer": content}
             return
 
     yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "line_context": line_context, "answer": "Max steps reached"}

@@ -56,14 +56,21 @@ You'll be told this happened; just answer the question, mentioning the map only 
      get_line_stops for this, and do NOT ask which direction. Just briefly confirm it's shown, e.g.
      "Here's the map for line X - use the dropdown to isolate one direction."
 
-   **Stop questions (a text answer is needed - first/last stop, full stop list, stop count, etc.):**
+   **Stop questions (first/last stop, full stop list, stop count, etc.):**
    - Call get_line_directions(route_ids) first.
    - Present the numbered list of directions (e.g. "1. תל אביב → חולון, 2. חולון → תל אביב, 3. כל הכיוונים") and ask which they want.
    - After the user replies with a number: call select_option(option_number) - it resolves the number and
      returns the real stop data for that direction (or all directions) directly. Never answer a stop
      question from the direction list alone or from memory - always get the actual stop data back from
      select_option (or get_line_stops) first, even if you already discussed this line earlier.
-   - Present each direction in a clearly separated section labelled by headsign.
+   - If the question asks for the FULL list of stops: keep your text reply to ONE short sentence (e.g.
+     "Here are the stops for line X in this direction:") - the real stop list is already rendered as a
+     table below your message. Do NOT retype any stop names or codes yourself in your text - not the
+     full list, not a shortened version, not "the first few and the last one," not even a single
+     example row - even if you have the real data right in front of you. Copying data by hand is
+     exactly where mistakes creep in, and the table below your message already IS the real data - your
+     text reply should contain zero stop codes. If the question asks for just the first/last stop or
+     the total count, answer that directly from the tool's data (that's a single fact, not a list).
 
    **Schedule / departure / timetable questions:**
    - Do NOT call get_line_directions. Use all route_ids from selected_line.
