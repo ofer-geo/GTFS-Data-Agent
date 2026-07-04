@@ -294,6 +294,14 @@ def _summarize_tool_result(func_name: str, content: str) -> str:
                     f"can_proceed={data.get('can_proceed')}, "
                     f"clarification_needed={data.get('clarification_needed')!r}]")
         elif func_name == "select_option":
+            # select_option is a dispatcher - a direction selection returns
+            # the same list-of-directions shape as get_line_stops (not the
+            # dict shape agency/route selections return), so it needs the
+            # same shape check as the get_line_stops case above rather than
+            # assuming every select_option result is a dict.
+            if isinstance(data, list):
+                parts = [f"{d.get('headsign', '?')} ({d.get('stops_count', '?')} stops)" for d in data]
+                return f"[select_option (direction): {len(data)} direction(s) — {'; '.join(parts)}]"
             return f"[select_option: can_proceed={data.get('can_proceed')}, agency={data.get('agency_name')}]"
         elif func_name == "run_sql":
             rows = data if isinstance(data, list) else []
@@ -591,9 +599,32 @@ def _verify_answer(question: str, draft: str, provider: str, model: str, client)
 # check across every fact type the app knows how to fetch, instead of one
 # bespoke check for stops specifically - adding a new fact-producing tool
 # later means adding one line here, not writing a new function.
+def _looks_like_stop_list(answer: str) -> bool:
+    """
+    Detects an individually-listed set of stops by combining two signals,
+    not just one literal template: (1) the exact "תחנה: X — קוד Y" / "stop:
+    X - code Y" format the system prompt mandates, which also catches even
+    a single non-fetched stop mention; (2) a broader SHAPE check - 5+
+    numbered list lines, each containing a stop-code-like 4-6 digit number
+    - which catches a fabricated list that doesn't follow the literal
+    template at all. Verified live: one fabrication used "תחנה: X — קוד Y"
+    (caught by (1)); a later, different fabrication used "N. תחנת X — קוד
+    Y" (numbered list, "תחנת" not "תחנה", no colon) - (1) alone missed it
+    completely, since it's a different literal phrasing, but (2) catches
+    it by structure regardless of the exact words used.
+    """
+    if re.search(r"(תחנה\s*[:：]|stop\s*[:：]\s*\S)", answer, re.IGNORECASE):
+        return True
+    numbered_lines_with_codes = sum(
+        1 for line in answer.splitlines()
+        if re.match(r"^\s*\d+[.)]\s", line) and re.search(r"\b\d{4,6}\b", line)
+    )
+    return numbered_lines_with_codes >= 5
+
+
 _FACT_PATTERNS = [
-    ("stop list", re.compile(r"(תחנה\s*[:：]|stop\s*[:：]\s*\S)", re.IGNORECASE), "stops"),
-    ("departure time", re.compile(r"\b([01]?\d|2[0-3]):[0-5]\d\b"), "timetable_days"),
+    ("stop list", _looks_like_stop_list, "stops"),
+    ("departure time", lambda a: bool(re.search(r"\b([01]?\d|2[0-3]):[0-5]\d\b", a)), "timetable_days"),
 ]
 
 
@@ -632,8 +663,8 @@ def _claims_facts_without_fetching(answer: str, line_context: dict):
     being reliable on the fact types it does check.
     """
     given = line_context.get("given", {})
-    for label, pattern, given_key in _FACT_PATTERNS:
-        if pattern.search(answer) and not given.get(given_key):
+    for label, matches, given_key in _FACT_PATTERNS:
+        if matches(answer) and not given.get(given_key):
             return label
     return None
 
@@ -832,7 +863,13 @@ def _build_plan(question: str, model_idx: int):
         return json.loads(cleaned)
 
     data, model_idx = _call_with_fallback(model_idx, _call)
-    if not data:
+    # Reject any non-dict shape, not just a falsy one - a bare, context-free
+    # reply like "1" (react_agent only passes the latest message, not the
+    # full conversation, to this classifier) can confuse the model into
+    # returning something that isn't {"subgoals": [...]} at all (e.g. a bare
+    # JSON list), which used to reach data.get(...) below and crash with
+    # AttributeError instead of being treated as "not a compound question."
+    if not isinstance(data, dict):
         return None, model_idx
 
     subgoals = []
@@ -1098,7 +1135,19 @@ def _run_sequencer_turn(question: str, plan_state: dict, line_context: dict, mod
             # else: bad reply / a real error - plan_state untouched, the
             # while loop below re-surfaces the same clarification
 
-    elif plan_state is None:
+    elif plan_state is None and selection_state.get("pending_type") is None:
+        # Skip the classifier entirely when a selection is already pending
+        # (agency/route/direction/schedule_choice from the normal, non-
+        # sequencer flow) - a bare numeric reply like "1" is answering
+        # THAT, never the start of a new compound-line question, and
+        # react_agent only passes the latest message here with none of the
+        # surrounding context, so asking the classifier to judge it is both
+        # wasted latency (an extra LLM call, with fallback retries, on
+        # every single turn) and a real failure risk: with nothing to go
+        # on, it can return a JSON shape that isn't {"subgoals": [...]} at
+        # all (verified live - a bare "1" produced a shape that used to
+        # crash _build_plan with AttributeError before the isinstance
+        # check above was added).
         candidate, model_idx = _build_plan(question, model_idx)
         provider, model = MODEL_PRIORITY[model_idx]
         client = get_client(provider)
