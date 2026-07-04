@@ -359,6 +359,29 @@ def _is_hebrew(text: str) -> bool:
     return bool(re.search(r"[֐-׿]", text))
 
 
+_GENERAL_DB_KEYWORDS = {
+    "how many", "most", "least", "highest", "lowest", "longest", "shortest", "average", "total",
+    "כמה", "הכי", "בממוצע", "בסך הכל", "הארוך ביותר", "הקצר ביותר", "הרב ביותר", "המעט ביותר",
+}
+
+
+def _looks_like_general_db_question(text: str) -> bool:
+    """
+    Keyword check for "how many X / which Y has the most Z" style
+    open-ended database questions - the ones the workflow tells the model
+    to answer via run_sql() directly, with no specific line/route_ids
+    involved at all. Checks the QUESTION'S intent rather than pattern-
+    matching the ANSWER'S numbers: an answer to a general-database
+    question could state almost any number in almost any phrasing, so
+    there's no reliable content signature to check after the fact (unlike
+    stop lists or departure times, which the system prompt mandates a
+    fixed format for) - classifying the question instead sidesteps that
+    entirely.
+    """
+    t = text.lower()
+    return any(kw in t for kw in _GENERAL_DB_KEYWORDS)
+
+
 def _with_closing_question(answer: str, hebrew: bool) -> str:
     """
     Appended to every genuinely finished answer (not a clarifying question,
@@ -1350,6 +1373,28 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     "only what it returns."})
                 continue
 
+            # Closes the same gap as unfetched_fact above, but for run_sql-
+            # style general database questions ("how many agencies are
+            # there", "which line has the most trips") instead of stops/
+            # timetables: an EARLIER, unrelated grounding (e.g. a specific
+            # line resolved several turns ago) makes already_grounded below
+            # permanently true, which would otherwise let a brand new,
+            # totally unrelated general-database claim through this turn
+            # with zero backing, since nothing forces a fresh run_sql call
+            # once anything at all has ever been grounded.
+            if (tool_calls_made == 0 and not line_context.get("given", {}).get("run_sql_used")
+                    and _looks_like_general_db_question(question)):
+                if _bail_if_stuck("run_sql_not_used"):
+                    yield {"status": "done", "log": list(log), "coords": list(coords), "map_data": map_data, "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+                    return
+                log.append({"type": "retry", "text": "general database question answered without calling run_sql - retrying"})
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                messages.append({"role": "user", "content":
+                    "This looks like a general database question. Call run_sql() to get the real answer "
+                    "before responding - do not answer from memory, even if you discussed something else "
+                    "earlier in this conversation."})
+                continue
+
             already_grounded = (
                 bool(line_context.get("route_ids"))
                 or data_tool_used
@@ -1497,6 +1542,12 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                 result_obj = json.loads(result)
             except (json.JSONDecodeError, TypeError):
                 result_obj = None
+
+            if func_name == "run_sql" and isinstance(result_obj, list):
+                # Tracked outside the route_ids gate below - a general
+                # database question (run_sql's own use case) often has no
+                # specific line/route_ids at all, unlike stops/timetables.
+                line_context["given"]["run_sql_used"] = True
 
             if line_context.get("route_ids"):
                 if func_name == "get_line_directions" and isinstance(result_obj, dict) and result_obj.get("directions"):
