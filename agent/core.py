@@ -6,7 +6,7 @@ from config import MODEL_PRIORITY
 from agent.tools import (
     tools_map, TOOLS_SCHEMA, selection_state, plot_route_map,
     get_line_variants, get_line_stops, select_option, get_agency_names,
-    plot_comparison_chart,
+    plot_comparison_chart, plot_multi_line_map,
 )
 from agent.prompts import SYSTEM_PROMPT
 from agent.utils import get_client
@@ -539,10 +539,16 @@ def _call_with_fallback(model_idx: int, call_fn):
         try:
             return call_fn(provider, model, client), idx
         except Exception as e:
-            es = str(e)
-            status = getattr(e, "status_code", None)
-            if _is_retryable_error(es, status) and idx + 1 < len(MODEL_PRIORITY):
-                print(f"[Agent] {MODEL_PRIORITY[idx]} failed ({_detect_limit_type(es)}) "
+            # Try the next model regardless of the error's exact shape -
+            # matching a growing allowlist of "retryable" error strings is
+            # exactly the kind of fix that breaks on the next new error
+            # shape (this codebase has already hit that twice: a 503 "high
+            # demand" case, then a 403 "access denied" case, both slipping
+            # past _is_retryable_error's keyword list and crashing instead
+            # of trying another provider). Always advancing removes that
+            # whole class of bug - trying another provider costs little.
+            if idx + 1 < len(MODEL_PRIORITY):
+                print(f"[Agent] {MODEL_PRIORITY[idx]} failed ({type(e).__name__}) "
                       f"building the plan - trying {MODEL_PRIORITY[idx + 1]}")
                 idx += 1
                 continue
@@ -815,10 +821,18 @@ def _finish_sequencer(plan_state: dict, line_context: dict, provider: str, model
         except Exception as e:
             print(f"[Agent] Sequencer comparison chart failed: {e}")
 
-        winner_route_ids = plan_state.get("route_ids", {}).get(winner)
-        if winner_route_ids:
+        # One map with every compared line (each its own color), not just
+        # the winner's - a "which line has more stops" question is inherently
+        # about more than one line, so the visual should show all of them.
+        lines_for_map = [
+            {"route_ids": plan_state.get("route_ids", {}).get(sg["target"]),
+             "line_num": sg["target"], "agency": sg.get("agency_name")}
+            for sg in plan_state["subgoals"]
+            if plan_state.get("route_ids", {}).get(sg["target"])
+        ]
+        if lines_for_map:
             try:
-                map_data = extract_map_data(plot_route_map(winner_route_ids, line_num=winner))
+                map_data = extract_map_data(plot_multi_line_map(lines_for_map))
             except Exception as e:
                 print(f"[Agent] Sequencer route map failed: {e}")
     else:
@@ -826,13 +840,13 @@ def _finish_sequencer(plan_state: dict, line_context: dict, provider: str, model
 
     final = _verify_answer(plan_state["original_question"], draft, provider, model, client)
     if chart_data and map_data:
-        final += (f" הצגתי גם תרשים השוואה ואת מפת המסלול של קו {winner}." if hebrew
-                  else f" I've also shown a comparison chart and the route map for line {winner}.")
+        final += (" הצגתי גם תרשים השוואה ומפה עם המסלולים של כל הקווים." if hebrew
+                  else " I've also shown a comparison chart and a map with all the compared lines.")
     elif chart_data:
         final += " הצגתי גם תרשים השוואה." if hebrew else " I've also shown a comparison chart."
     elif map_data:
-        final += (f" הצגתי גם את מפת המסלול של קו {winner}." if hebrew
-                  else f" I've also shown the route map for line {winner}.")
+        final += (" הצגתי גם מפה עם המסלולים של כל הקווים." if hebrew
+                  else " I've also shown a map with all the compared lines.")
     final = _with_closing_question(final, hebrew)
 
     line_context.setdefault("given", {})["comparison_done"] = True
@@ -1090,26 +1104,34 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     "function-calling format. Try again."})
                 continue
 
+            # Try the next model regardless of the error's exact shape - not
+            # just a known "retryable" allowlist. Keyword/status-code
+            # matching is exactly the kind of fix that breaks on the next
+            # new error shape: this codebase has already hit that twice (a
+            # 503 "high demand" case, then a 403 "access denied" case, both
+            # slipping past the old check and crashing the whole request
+            # instead of trying another provider). Always advancing removes
+            # that whole class of bug - trying another provider costs little.
+            if model_idx + 1 < len(MODEL_PRIORITY):
+                old_model = model
+                model_idx += 1
+                provider, model = MODEL_PRIORITY[model_idx]
+                client = get_client(provider)
+                log.append({
+                    "type": "switch",
+                    "text": f"{type(e).__name__} on {old_model} - switching to {model}",
+                    "from_model": old_model,
+                    "to_model": model,
+                    "limit_type": _detect_limit_type(es),
+                })
+                yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
+                continue
+
+            # --- Whole chain exhausted ---
             if _is_retryable_error(es, status):
+                # A known rate-limit/overload shape - waiting can plausibly
+                # help, so retry the same (last) model after a pause.
                 limit_type = _detect_limit_type(es)
-
-                if model_idx + 1 < len(MODEL_PRIORITY):
-                    # --- Fall through to the next model in the priority chain ---
-                    old_model = model
-                    model_idx += 1
-                    provider, model = MODEL_PRIORITY[model_idx]
-                    client = get_client(provider)
-                    log.append({
-                        "type": "switch",
-                        "text": f"{limit_type} limit on {old_model} - switching to {model}",
-                        "from_model": old_model,
-                        "to_model": model,
-                        "limit_type": limit_type,
-                    })
-                    yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
-                    continue
-
-                # --- Whole chain exhausted: wait and retry the last model ---
                 wait_s = 60 if provider == "google" else 20
                 log.append({
                     "type": "retry",
@@ -1125,7 +1147,11 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     time.sleep(0.5)
                 continue
 
-            raise
+            # An unrecognized error, and every model in the chain has now
+            # failed on it - waiting wouldn't obviously help, so surface a
+            # clear message instead of crashing with a raw exception.
+            yield {"status": "done", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "line_context": line_context, "answer": _stuck_answer()}
+            return
 
         content, tool_calls = _parse_response(current_response, provider)
         if tool_calls:
@@ -1471,19 +1497,23 @@ def react_agent(question: str, context: list = None, max_steps: int = 15, stop_e
                     es = str(e)
                     status = getattr(e, "status_code", None)
                     print(f"[Agent] LLM error (finalizing clarification) - type={type(e).__name__!r} status={status!r} msg={es[:300]!r}")
-                    if not _is_retryable_error(es, status) or model_idx + 1 >= len(MODEL_PRIORITY):
+                    # Advance to the next model regardless of the error's
+                    # exact shape (see the main loop's LLM-error handling for
+                    # why this shouldn't be gated on a "retryable" keyword
+                    # allowlist). content already has a safe fallback set
+                    # above, so exhausting the chain here just uses that.
+                    if model_idx + 1 >= len(MODEL_PRIORITY):
                         break
-                    limit_type = _detect_limit_type(es)
                     old_model = model
                     model_idx += 1
                     provider, model = MODEL_PRIORITY[model_idx]
                     client = get_client(provider)
                     log.append({
                         "type": "switch",
-                        "text": f"{limit_type} limit on {old_model} - switching to {model}",
+                        "text": f"{type(e).__name__} on {old_model} - switching to {model}",
                         "from_model": old_model,
                         "to_model": model,
-                        "limit_type": limit_type,
+                        "limit_type": _detect_limit_type(es),
                     })
                     yield {"status": "retry", "log": list(log), "coords": list(coords), "chart_data": chart_data, "timetable_data": timetable_data, "answer": None}
 
