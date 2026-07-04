@@ -664,6 +664,42 @@ def _dispatch_goal(subgoal: dict, resolved: dict):
     return None, route_ids
 
 
+def _format_clarification(subgoal: dict, data: dict, hebrew: bool) -> str:
+    """
+    Builds the clarification text from a get_line_variants-shaped result.
+    Always prefer data["agency_name"] over subgoal["agency_name"] when both
+    could apply - data reflects what was JUST resolved (e.g. the agency the
+    user picked a moment ago), while the subgoal's own value can be a stale
+    guess from the original plan. If data omits agency_name (get_line_variants'
+    "a selection is already pending" short-circuit doesn't return one), the
+    caller is responsible for having already updated subgoal["agency_name"]
+    from the last real resolution, so falling back to it here is still safe.
+    """
+    options = data.get("options", [])
+    formatted = "\n".join(f"{o['option_number']}. {o['label']}" for o in options)
+    if data.get("clarification_needed") == "agency":
+        intro = (f"קו {subgoal['target']} מופעל על ידי יותר ממפעיל אחד — לאיזה מהם התכוונת?" if hebrew
+                  else f"Line {subgoal['target']} is operated by more than one agency — which one did you mean?")
+    else:
+        # "route" here means 2+ unrelated line groups happen to share this
+        # display number under the same agency (e.g. a Tel Aviv service
+        # and a Beer Sheva service both labeled "126") - NOT directions of
+        # one line, which is a separate concept (get_line_directions).
+        # Saying "route" reads as ambiguous with "direction" to a user who
+        # doesn't know the internal terminology, so spell out "line" instead.
+        agency = data.get("agency_name") or subgoal.get("agency_name") or ""
+        if hebrew:
+            intro = (f"יש יותר מקו אחד עם המספר {subgoal['target']}"
+                      + (f" של {agency}" if agency else "") + " — לאיזה מהם התכוונת?")
+        else:
+            intro = (f"There's more than one line numbered {subgoal['target']}"
+                      + (f" operated by {agency}" if agency else "") + " — which one did you mean?")
+    prompt = "אנא הזן מספר." if hebrew else "Please enter a number."
+    # \n\n (not a single \n) so Markdown breaks out of the numbered list
+    # into a new paragraph, instead of gluing this onto the last item.
+    return f"{intro}\n\n{formatted}\n\n{prompt}"
+
+
 def _resolve_current_subgoal(plan_state: dict):
     """
     Deterministically drives the current sub-goal to completion or to a
@@ -688,30 +724,14 @@ def _resolve_current_subgoal(plan_state: dict):
         data = json.loads(raw)
 
     if data.get("clarification_needed"):
-        options = data.get("options", [])
-        formatted = "\n".join(f"{o['option_number']}. {o['label']}" for o in options)
+        # Keep the subgoal's own agency_name in sync with whatever was just
+        # resolved, so a later stale/duplicate query (get_line_variants'
+        # "already pending" short-circuit doesn't return agency_name at all)
+        # still has a correct fallback instead of the original plan's guess.
+        if data.get("agency_name"):
+            subgoal["agency_name"] = data["agency_name"]
         hebrew = _is_hebrew(plan_state["original_question"])
-        if data["clarification_needed"] == "agency":
-            intro = (f"קו {subgoal['target']} מופעל על ידי יותר ממפעיל אחד — לאיזה מהם התכוונת?" if hebrew
-                      else f"Line {subgoal['target']} is operated by more than one agency — which one did you mean?")
-        else:
-            # "route" here means 2+ unrelated line groups happen to share this
-            # display number under the same agency (e.g. a Tel Aviv service
-            # and a Beer Sheva service both labeled "126") - NOT directions of
-            # one line, which is a separate concept (get_line_directions).
-            # Saying "route" reads as ambiguous with "direction" to a user who
-            # doesn't know the internal terminology, so spell out "line" instead.
-            agency = data.get("agency_name") or subgoal.get("agency_name") or ""
-            if hebrew:
-                intro = (f"יש יותר מקו אחד עם המספר {subgoal['target']}"
-                          + (f" של {agency}" if agency else "") + " — לאיזה מהם התכוונת?")
-            else:
-                intro = (f"There's more than one line numbered {subgoal['target']}"
-                          + (f" operated by {agency}" if agency else "") + " — which one did you mean?")
-        prompt = "אנא הזן מספר." if hebrew else "Please enter a number."
-        # \n\n (not a single \n) so Markdown breaks out of the numbered list
-        # into a new paragraph, instead of gluing this onto the last item.
-        return ("clarification", f"{intro}\n\n{formatted}\n\n{prompt}")
+        return ("clarification", _format_clarification(subgoal, data, hebrew))
 
     if not data.get("can_proceed"):
         return ("error", data.get("reason") or f"Couldn't resolve line {subgoal['target']}.")
@@ -808,10 +828,22 @@ def _run_sequencer_turn(question: str, plan_state: dict, line_context: dict, mod
         m = re.search(r"\b(\d+)\b", question.strip())
         if m:
             sel = json.loads(select_option(int(m.group(1))))
+            subgoal = plan_state["subgoals"][plan_state["current_index"]]
             if sel.get("can_proceed"):
-                value, route_ids = _dispatch_goal(plan_state["subgoals"][plan_state["current_index"]], sel)
+                value, route_ids = _dispatch_goal(subgoal, sel)
                 _apply_subgoal_result(plan_state, value, route_ids)
-            # else: bad/still-ambiguous reply - plan_state untouched, the
+            elif sel.get("clarification_needed"):
+                # select_option progressed to a NEW disambiguation stage
+                # (e.g. agency -> route) - answer directly from `sel`, which
+                # already reflects what was just picked, instead of letting
+                # the while loop below re-derive it via a stale/duplicate
+                # get_line_variants call that won't carry the right agency.
+                if sel.get("agency_name"):
+                    subgoal["agency_name"] = sel["agency_name"]
+                hebrew = _is_hebrew(plan_state["original_question"])
+                msg = _format_clarification(subgoal, sel, hebrew)
+                return _sequencer_update(line_context, plan_state, msg), model_idx
+            # else: bad reply / a real error - plan_state untouched, the
             # while loop below re-surfaces the same clarification
 
     elif plan_state is None:

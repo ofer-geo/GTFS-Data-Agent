@@ -803,11 +803,16 @@ def plot_comparison_chart(results: dict, title: str = "") -> str:
     to a number.
     """
     try:
+        # Line numbers are labels, not quantities - explicitly force a
+        # categorical axis. Without this, Plotly can infer a numeric/linear
+        # axis from digit-looking strings (e.g. "125" vs "947"), spacing bars
+        # proportionally to the numeric gap between them instead of showing
+        # them as adjacent, equally-spaced categories.
         fig = go.Figure(go.Bar(x=[str(k) for k in results], y=list(results.values())))
         fig.update_layout(
             title=title or "Comparison",
             height=340,
-            xaxis_title="Line",
+            xaxis=dict(type="category", title="Line"),
             yaxis_title="Value",
             margin=dict(l=55, r=30, t=60, b=40),
         )
