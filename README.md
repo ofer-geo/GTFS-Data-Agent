@@ -5,6 +5,16 @@ An AI agent that answers natural-language questions about Israeli public transpo
 
 Ask in plain language ("What is the first stop of line 5?", "מה לוח הזמנים של קו 18 ביום חמישי?", "Which has more stops, line 5 or line 4?") and the agent figures out which database queries to run, handles ambiguity (a line number can belong to many operators), and answers in your language.
 
+Built with **Tamir Edelstein** (Elia Transportation Engineering) for **Bar-Ilan University's Data
+Science programme**. Work in progress.
+
+![Chat with a live route map: stops numbered, one colour per direction](docs/images/gtfs-agent-route-map.png)
+
+![Average departures per hour, working days vs Friday vs Saturday](docs/images/gtfs-agent-departure-chart.png)
+
+*Above: a route map is drawn as soon as a line is identified. Below it: departure frequency by
+hour and day type, generated on request.*
+
 ---
 
 ## What it does
@@ -162,3 +172,10 @@ The app opens at `http://localhost:8501`. The first run downloads and loads the 
 ## Tech stack
 
 Python · Streamlit · DuckDB · Plotly · multi-provider LLM tool-calling (Google Gemini / Groq, with OpenAI / Anthropic supported in code)
+
+---
+
+## Authors
+
+**Ofer Shahal** and **Tamir Edelstein**, Bar-Ilan University Data Science programme.
+Project page: [ofer-geo.github.io/personal_portfolio](https://ofer-geo.github.io/personal_portfolio/projects/gtfs-transit-agent/)
